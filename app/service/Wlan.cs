@@ -27,6 +27,7 @@ public static class Wlan
             try
             {
                 int count = Marshal.ReadInt32(listPtr);
+                var anyConnected = false;
                 for (int i = 0; i < count; i++)
                 {
                     // WLAN_INTERFACE_INFO: GUID (16), WCHAR[256], state (4) = 532 bytes, after 8 header bytes.
@@ -34,9 +35,13 @@ public static class Wlan
                     var guid = Marshal.PtrToStructure<Guid>(item);
                     var state = Marshal.ReadInt32(item + 16 + 512);
                     if (state != 1 /* wlan_interface_state_connected */) continue;
-                    return Query(h, guid, out why, readKey);
+                    anyConnected = true;
+                    // A connected virtual/other WLAN interface may not answer the
+                    // current-connection query; keep looking at the rest instead
+                    // of returning null for all of them.
+                    if (Query(h, guid, out why, readKey) is { } network) return network;
                 }
-                why = "Wi-Fi is not connected";
+                if (!anyConnected) why = "Wi-Fi is not connected";
                 return null;
             }
             finally { WlanFreeMemory(listPtr); }
@@ -334,43 +339,63 @@ public static class Wlan
         }
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        var nextAsk = DateTime.MinValue;
+        var attempts = 0;
         var said = false;
+        var lastWhy = "";
         while (true)
         {
-            if (Current(out _) is { } current)
+            // Do not read the key here: a protected WPA3 profile still counts as
+            // connected, but Wlan.Current(readKey: true) would report it as null.
+            if (Current(out lastWhy, readKey: false) is { } current)
             {
                 say($"Wi-Fi: Windows is connected to \"{current.Ssid}\"" +
                     (current.Ssid == wanted ? "" : $" (not \"{wanted}\"; leaving it)"));
                 return true;
             }
-            if (Open(out var h))
-            {
-                try
-                {
-                    if (FirstInterface(h) is { } g)
-                    {
-                        var parameters = new WlanConnectionParameters
-                        {
-                            connectionMode = 0, // wlan_connection_mode_profile
-                            strProfile = profileName,
-                            pDot11Ssid = IntPtr.Zero,
-                            pDesiredBssidList = IntPtr.Zero,
-                            dot11BssType = 1, // infrastructure
-                        };
-                        if (!said)
-                        {
-                            say($"Wi-Fi: asking Windows to reconnect to \"{wanted}\"");
-                            said = true;
-                        }
-                        WlanConnect(h, ref g, ref parameters, IntPtr.Zero);
-                    }
-                }
-                finally { WlanCloseHandle(h, IntPtr.Zero); }
-            }
             if (DateTime.UtcNow >= deadline) break;
+            // WlanConnect while Windows is associating cancels that association
+            // ("the user wants to establish a new connection"), so wait for it.
+            if (IsConnecting())
+            {
+                Thread.Sleep(1000);
+                continue;
+            }
+            // Two asks at most: a third WlanConnect can tear down the connection
+            // Windows has just completed while this loop still cannot see it.
+            if (DateTime.UtcNow >= nextAsk && attempts < 2)
+            {
+                if (Open(out var h))
+                {
+                    try
+                    {
+                        if (FirstInterface(h) is { } g)
+                        {
+                            var parameters = new WlanConnectionParameters
+                            {
+                                connectionMode = 0, // wlan_connection_mode_profile
+                                strProfile = profileName,
+                                pDot11Ssid = IntPtr.Zero,
+                                pDesiredBssidList = IntPtr.Zero,
+                                dot11BssType = 1, // infrastructure
+                            };
+                            if (!said)
+                            {
+                                say($"Wi-Fi: asking Windows to reconnect to \"{wanted}\"");
+                                said = true;
+                            }
+                            WlanConnect(h, ref g, ref parameters, IntPtr.Zero);
+                        }
+                    }
+                    finally { WlanCloseHandle(h, IntPtr.Zero); }
+                }
+                attempts++;
+                nextAsk = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            }
             Thread.Sleep(1000);
         }
-        say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own");
+        say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own" +
+            (lastWhy.Length > 0 ? $" (last state: {lastWhy})" : ""));
         return false;
     }
 

@@ -137,7 +137,7 @@ public static class WlanBackup
     public static void RestoreAndConnect(Action<string> say, string? preferredSsid = null)
     {
         Restore(say, TimeSpan.FromSeconds(60));
-        if (Wlan.Current(out _) is not null) return;
+        if (Wlan.Current(out _, readKey: false) is not null) return;
         if (Wlan.WiredUp())
         {
             say("Wi-Fi: a wired connection is up; not reconnecting Windows to Wi-Fi");
