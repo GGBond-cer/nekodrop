@@ -1302,8 +1302,9 @@ bool IwxDevice::open(const Options &options, std::string &error) {
   return true;
 }
 
-void IwxDevice::stop() {
-  if (!_proxy.is_open()) return;
+bool IwxDevice::stop() {
+  if (!_proxy.is_open()) return true;
+  bool clean = true;
   if (_open || !_fw_sections.empty()) {
     /* iwx_stop_device: stop receive DMA, then the bus master, then reset. */
     if (nic_lock()) {
@@ -1315,6 +1316,8 @@ void IwxDevice::stop() {
         delay_us(10);
       }
       nic_unlock();
+    } else {
+      clean = false;
     }
     if (bz()) {
       /* Linux Bz: drop MAC_INIT and the AUX ownership, then reset; the old
@@ -1329,7 +1332,7 @@ void IwxDevice::stop() {
     _nic_locks = 0;
     sw_reset();
     mask_interrupts();
-    prepare_card_hw();
+    if (!prepare_card_hw()) clean = false;
   }
   _proxy.set_close_ops({});
   _open = false;
@@ -1341,6 +1344,7 @@ void IwxDevice::stop() {
   for (auto &p : _bz_peers) p = BzPeer{};
   _reorder.clear();
   _deferred_rx.clear();
+  return clean;
 }
 
 /* ---------------------------------------------------------------- commands */

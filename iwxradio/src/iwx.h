@@ -216,7 +216,10 @@ public:
    * logs the firmware's error logs and marks the device unhealthy. */
   void check_health();
   /* Stops DMA and resets the card. Safe to call twice. */
-  void stop();
+  /* Stops the receive DMA, resets the firmware and releases the card.
+   * Returns false when the MAC access or the post-reset preparation did not
+   * complete, so the service can fall back to a PnP restart. */
+  bool stop();
 
   void set_rx_handler(RxHandler handler) { _on_rx = std::move(handler); }
   const TxStats &tx_stats() const { return _tx_stats; }

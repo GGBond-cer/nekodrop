@@ -27,6 +27,7 @@ public static class Wlan
             try
             {
                 int count = Marshal.ReadInt32(listPtr);
+                var anyConnected = false;
                 for (int i = 0; i < count; i++)
                 {
                     // WLAN_INTERFACE_INFO: GUID (16), WCHAR[256], state (4) = 532 bytes, after 8 header bytes.
@@ -34,9 +35,13 @@ public static class Wlan
                     var guid = Marshal.PtrToStructure<Guid>(item);
                     var state = Marshal.ReadInt32(item + 16 + 512);
                     if (state != 1 /* wlan_interface_state_connected */) continue;
-                    return Query(h, guid, out why, readKey);
+                    anyConnected = true;
+                    // A connected virtual/other WLAN interface may not answer the
+                    // current-connection query; keep looking at the rest instead
+                    // of returning null for all of them.
+                    if (Query(h, guid, out why, readKey) is { } network) return network;
                 }
-                why = "Wi-Fi is not connected";
+                if (!anyConnected) why = "Wi-Fi is not connected";
                 return null;
             }
             finally { WlanFreeMemory(listPtr); }
@@ -69,6 +74,48 @@ public static class Wlan
             finally { WlanFreeMemory(listPtr); }
         }
         finally { WlanCloseHandle(h, IntPtr.Zero); }
+    }
+
+    /// <summary>
+    /// True when a Windows WLAN interface has a non-APIPA IPv4 address and a
+    /// default gateway. Wlan.Current only proves association; this proves the
+    /// DHCP/default-route handoff actually completed after the card returns.
+    /// </summary>
+    public static bool Ipv4Ready()
+    {
+        try
+        {
+            return System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces().Any(n =>
+                n.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up &&
+                n.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Wireless80211 &&
+                n.Name != "nekodrop" &&
+                n.GetIPProperties().UnicastAddresses.Any(a =>
+                    a.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                    !IsApipa(a.Address)) &&
+                n.GetIPProperties().GatewayAddresses.Any(g =>
+                    g.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                    !g.Address.Equals(System.Net.IPAddress.Any)));
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException) { return false; }
+    }
+
+    /// <summary>Waits for DHCP/NLA to finish after Windows joins the network.</summary>
+    public static bool WaitForIpv4(TimeSpan timeout, CancellationToken token = default)
+    {
+        var end = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            if (token.IsCancellationRequested) return false;
+            if (Ipv4Ready()) return true;
+            if (DateTime.UtcNow >= end) return false;
+            if (token.WaitHandle.WaitOne(250)) return false;
+        }
+    }
+
+    static bool IsApipa(System.Net.IPAddress address)
+    {
+        var b = address.GetAddressBytes();
+        return b.Length == 4 && b[0] == 169 && b[1] == 254;
     }
 
     /// <summary>
@@ -295,7 +342,7 @@ public static class Wlan
     /// first non-hidden auto-connect profile. Used after AirDrop gives the card
     /// back, when Windows often sits disconnected until the user clicks Wi-Fi.
     /// </summary>
-    public static bool ConnectDefault(Action<string> say, string? preferredSsid = null)
+    public static bool ConnectDefault(Action<string> say, string? preferredSsid = null, CancellationToken token = default)
     {
         var profiles = SavedProfiles();
         SavedProfile? pick = null;
@@ -334,43 +381,64 @@ public static class Wlan
         }
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        var nextAsk = DateTime.MinValue;
+        var attempts = 0;
         var said = false;
+        var lastWhy = "";
         while (true)
         {
-            if (Current(out _) is { } current)
+            if (token.IsCancellationRequested) return false;
+            // Do not read the key here: a protected WPA3 profile still counts as
+            // connected, but Wlan.Current(readKey: true) would report it as null.
+            if (Current(out lastWhy, readKey: false) is { } current)
             {
                 say($"Wi-Fi: Windows is connected to \"{current.Ssid}\"" +
                     (current.Ssid == wanted ? "" : $" (not \"{wanted}\"; leaving it)"));
                 return true;
             }
-            if (Open(out var h))
-            {
-                try
-                {
-                    if (FirstInterface(h) is { } g)
-                    {
-                        var parameters = new WlanConnectionParameters
-                        {
-                            connectionMode = 0, // wlan_connection_mode_profile
-                            strProfile = profileName,
-                            pDot11Ssid = IntPtr.Zero,
-                            pDesiredBssidList = IntPtr.Zero,
-                            dot11BssType = 1, // infrastructure
-                        };
-                        if (!said)
-                        {
-                            say($"Wi-Fi: asking Windows to reconnect to \"{wanted}\"");
-                            said = true;
-                        }
-                        WlanConnect(h, ref g, ref parameters, IntPtr.Zero);
-                    }
-                }
-                finally { WlanCloseHandle(h, IntPtr.Zero); }
-            }
             if (DateTime.UtcNow >= deadline) break;
-            Thread.Sleep(1000);
+            // WlanConnect while Windows is associating cancels that association
+            // ("the user wants to establish a new connection"), so wait for it.
+            if (IsConnecting())
+            {
+                if (token.WaitHandle.WaitOne(1000)) return false;
+                continue;
+            }
+            // Two asks at most: a third WlanConnect can tear down the connection
+            // Windows has just completed while this loop still cannot see it.
+            if (DateTime.UtcNow >= nextAsk && attempts < 2)
+            {
+                if (Open(out var h))
+                {
+                    try
+                    {
+                        if (FirstInterface(h) is { } g)
+                        {
+                            var parameters = new WlanConnectionParameters
+                            {
+                                connectionMode = 0, // wlan_connection_mode_profile
+                                strProfile = profileName,
+                                pDot11Ssid = IntPtr.Zero,
+                                pDesiredBssidList = IntPtr.Zero,
+                                dot11BssType = 1, // infrastructure
+                            };
+                            if (!said)
+                            {
+                                say($"Wi-Fi: asking Windows to reconnect to \"{wanted}\"");
+                                said = true;
+                            }
+                            WlanConnect(h, ref g, ref parameters, IntPtr.Zero);
+                        }
+                    }
+                    finally { WlanCloseHandle(h, IntPtr.Zero); }
+                }
+                attempts++;
+                nextAsk = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            }
+            if (token.WaitHandle.WaitOne(1000)) return false;
         }
-        say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own");
+        say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own" +
+            (lastWhy.Length > 0 ? $" (last state: {lastWhy})" : ""));
         return false;
     }
 

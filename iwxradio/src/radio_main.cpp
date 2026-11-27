@@ -409,6 +409,13 @@ int main(int argc, char **argv) {
   std::thread stdin_thread([&] {
     char line[128];
     while (!stopping() && std::fgets(line, sizeof(line), stdin)) {
+      if (std::strncmp(line, "quit", 4) == 0) {
+        /* Let the device thread run dev.stop(): IwxDevice::stop() resets the
+         * firmware and DMA. Killing the process skips it and can leave the
+         * card in a degraded AWDL state after Windows takes it back. */
+        g_stop = true;
+        break;
+      }
       if (std::strncmp(line, "rejoin", 6) == 0) {
         inbox.push({kRejoinRequest, {}});
         continue;
@@ -1923,7 +1930,13 @@ int main(int argc, char **argv) {
       tap_thread.join();
     }
     if (!dev.healthy()) log_line("the card stopped answering or the firmware failed");
-    dev.stop();
+    bool clean = true;
+    if constexpr (std::is_same_v<Dev, IwxDevice>) clean = dev.stop();
+    else dev.stop();
+    if (!clean) {
+      failed = true;
+      log_line("device stop did not complete cleanly; a PnP restart is required");
+    }
     };
     if (opt.kernel) {
       KernelDevice kdev(log_line);
