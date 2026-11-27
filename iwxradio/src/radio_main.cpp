@@ -1503,6 +1503,10 @@ int main(int argc, char **argv) {
             uint8_t delba[awdl::kDelbaLength];
             awdl::build_delba(delba, agg.peer, dev_address, kAwdlBssid, 0, true, ++mgmt_seq);
             stop("bulk send finished; ended our Block Ack session");
+            /* This session did produce Block Acks: forgive earlier stalls, so a
+             * once-broken peer does not keep aggregation off for the rest of the
+             * radio's life. */
+            agg.stalls = 0;
             uq.push_front({std::vector<uint8_t>(delba, delba + sizeof(delba)), TxRate{}, false});
           }
           const auto &a = dev.agg_stats();
@@ -1526,9 +1530,11 @@ int main(int argc, char **argv) {
               agg.retry_us = t + 2000000;
               stop("HE80 TLC gave no Block Acks; falling back to VHT80");
             } else {
-              /* A second stall means this card's firmware never reports Block
-               * Acks (seen on an AX210, #39): stop asking until the radio restarts. */
-              agg.retry_us = ++agg.stalls >= 2 ? UINT64_MAX : t + awdl::kBaTxFailBackoffUS;
+              /* A second stall means this card's firmware is probably not
+               * reporting Block Acks (seen on an AX210, #39). Back off for a
+               * long while rather than until the radio restarts: a later peer
+               * or a channel change can still make aggregation work. */
+              agg.retry_us = awdl::ba_tx_retry_us(++agg.stalls, t);
               stop(detail);
             }
             /* The peer still holds the session it agreed to: end it (DELBA), as
@@ -1538,7 +1544,9 @@ int main(int argc, char **argv) {
             uint8_t delba[awdl::kDelbaLength];
             awdl::build_delba(delba, agg.peer, dev_address, kAwdlBssid, 0, true, ++mgmt_seq);
             uq.push_front({std::vector<uint8_t>(delba, delba + sizeof(delba)), TxRate{}, false});
-            if (agg.retry_us == UINT64_MAX) log_line("aggregate: off until the radio restarts (no Block Acks twice)");
+            if (agg.stalls >= awdl::kBaTxStallLimit)
+              log_line("aggregate: no Block Acks again; next attempt in " +
+                       std::to_string(awdl::kBaTxLongBackoffUS / 1000000) + " s");
           }
         }
       }

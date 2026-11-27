@@ -579,6 +579,18 @@ int main(int argc, char **argv) {
   CHECK(!awdl::ba_tx_stalled_as_singles(256, 1, 200), "no-BA fallback stays quiet once any Block Ack arrives");
   CHECK(awdl::ba_tx_stalled_as_singles(128, 0, 64), "no-BA fallback triggers on 128 frames / 0 BA / 64 singles");
 
+  /* Never disable A-MPDU sending for the rest of the radio's life: a first
+   * stall retries after a minute, later ones after five, and a session that did
+   * produce Block Acks clears the count (#39). */
+  CHECK(awdl::ba_tx_retry_us(1, 1000) == 1000 + awdl::kBaTxFailBackoffUS,
+        "a first BA stall retries after the short backoff");
+  CHECK(awdl::ba_tx_retry_us(2, 1000) == 1000 + awdl::kBaTxLongBackoffUS,
+        "the second BA stall backs off for the long interval");
+  CHECK(awdl::ba_tx_retry_us(9, 1000) == 1000 + awdl::kBaTxLongBackoffUS,
+        "later BA stalls keep the long backoff, never forever");
+  CHECK(awdl::kBaTxLongBackoffUS > awdl::kBaTxFailBackoffUS,
+        "the long backoff is longer than the short one");
+
   /* Intel station RX Block Ack reordering (PR #93). */
   {
     iwx::RxBaReorder ba;
