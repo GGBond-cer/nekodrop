@@ -8,7 +8,7 @@ nekodrop 通过模块化底层驱动后端（`CardCatalog` + `radio_backend.h`�
 
 - **Intel** 22000 / AX210 族，以及实验性的 **BE200**（`nekodrop-radio.exe`，移植自 [ForbiddenItlwm](https://github.com/retropineaple/ForbiddenItlwm) 的 `hal_iwx`）：同时连 Wi-Fi 或按需接管。
 - **Realtek RTL8852CE**（`nekodrop-radio-rtl.exe`，基于 [winawdl](https://github.com/raph559/winawdl)/[devourer](https://github.com/raph559/devourer)）：按需接管。
-- **MediaTek MT7902**（`nekodrop-radio-mt.exe`）和 **MT7921 / MT7922**（`nekodrop-radio-mtk.exe`），从 Linux mt76 移植到用户态：同时连 Wi-Fi（仅 5 GHz）或按需接管。
+- **MediaTek MT7902 / MT7925**（`nekodrop-radio-mt.exe`）和 **MT7921 / MT7922**（`nekodrop-radio-mtk.exe`），从 Linux mt76 移植到用户态：同时连 Wi-Fi（仅 5 GHz）或按需接管。
 
 哪些在真机上测过，见下表。表外的网卡见[适配新网卡](#适配新网卡)。
 
@@ -27,6 +27,7 @@ nekodrop 通过模块化底层驱动后端（`CardCatalog` + `radio_backend.h`�
 | So 平台上的 Intel Wi-Fi 6 AX203 / 9560 | 与 AX211 相同 | `so-a0-hr/jf-b0-68`（`iwx`，同时连 Wi-Fi / 按需） | ⚠️ 未测试 |
 | **Realtek RTL8852CE** | `10EC:C852` | 内嵌固件（`devourer`，仅按需接管） | ✅ 已内置；用户实测双向可用，峰值约 **24.5 MB/s**（[#61](../../../issues/61)） |
 | **MediaTek MT7902** | `14C3:7902` | linux-firmware `WIFI_RAM_CODE_MT7902_1`（移植自 `mt76`，同时连 Wi-Fi（仅 5 GHz）与按需接管） | ✅ 已内置；双向 AirDrop（接收约 15 MB/s，发送约 5 MB/s）与同时连 Wi-Fi 均已真机实测（[#34](../../../pull/34)、[#47](../../../pull/47)） |
+| **MediaTek MT7925** | `14C3:7925` | linux-firmware `WIFI_RAM_CODE_MT7925_1_1`（`mtradio --mt7925`，同时连 Wi-Fi（仅 5 GHz）与按需接管） | ✅ 已内置；双向 AirDrop（开启高吞吐模式发送均速约 37.5 MB/s / 峰值 52.5 MB/s，接收约 27.5 MB/s）与 5 GHz 同时连 Wi-Fi 均已真机实测（`SUBSYS_60001A3B`，[docs/MT7925.md](MT7925.md)） |
 | **MediaTek MT7922 / AMD RZ616** | `14C3:0616` `14C3:7922` | linux-firmware `WIFI_RAM_CODE_MT7922_1`（`mtkradio`，同时连 Wi-Fi（仅 5 GHz，实验性）与按需接管） | 🧪 实验性，已内置；双向 AirDrop 已实测（[#40](../../../pull/40)，[docs/MT7922.md](MT7922.md)）；`v2.2.8`–`v2.2.9` 已补齐 HE80 2SS LWTBL、扫描 `FIF_BIT_CLR`、固件 RA 与 RX A-MSDU 修复（[#65](../../../pull/65)、[#66](../../../issues/66)） |
 | **MediaTek MT7921 / AMD RZ608** | `14C3:7961` `14C3:0608` | linux-firmware `WIFI_RAM_CODE_MT7961_1`（`mtkradio`，同时连 Wi-Fi（仅 5 GHz，实验性）与按需接管） | ⚠️ 实验性，已内置；按需与同时连 Wi-Fi 均尚未在真机上测试 |
 | **Intel Wi-Fi 6 AX203**（Arrow Lake，CNVi） | `8086:7740` | linux-firmware `bz-b0-hr-b0-100` + PNVM（`iwx` 的 Bz/MLD 路径，同时连 Wi-Fi / 按需） | ✅ 已在真机实测：Mac ↔ PC 双向 AirDrop，Mac 能看到本机 |
@@ -39,7 +40,7 @@ nekodrop 通过模块化底层驱动后端（`CardCatalog` + `radio_backend.h`�
 
 网卡按 PCI ID 自动识别。没识别出来时，可以在 *设置 → 网卡* 里手动选择网卡和型号（只对驱动包里列出的硬件 ID 有效）。想给 nekodrop 适配新的网卡家族，见 [docs/ADDING-A-CARD.md](ADDING-A-CARD.md)。
 
-不确定自己是什么网卡，或者希望支持别的网卡？[诊断报告](SUPPORT.zh-CN.md#反馈问题诊断报告)不装 nekodrop 也能用：下载 [`installer/report.ps1`](../installer/report.ps1)，运行 `powershell -ExecutionPolicy Bypass -File report.ps1`。它会列出每块无线网卡的 PCI ID、芯片、驱动，以及 nekodrop 为什么能或不能在上面运行；欢迎贴到 [Issues](../../../issues)。已安装 nekodrop 时，运行 `NekoDropService.exe --status` 可查看匹配到的网卡档案、能力与当前驱动提供者，`NekoDropService.exe --selftest` 可在无网卡、无管理员权限下校验全部 22 个活跃网卡档案以及多后端启动参数规划。Intel 的 radio 启动时会记一行 `backend …` 日志并在每次构建时运行 `iwx_selftest`；Realtek 的 radio 构建会同步运行四项离线单测（`block_ack_test`、`reorder_buffer_test`、`outgoing_session_test`、`dma_address_test`）；`install.ps1 -SelfTest`、`restore.ps1 -SelfTest` 和 `report.ps1 -SelfTest` 也会在每次构建时于 Windows PowerShell 5.1 下运行离线自检。支持其他网卡需要做什么，见 [docs/HARDWARE.md](HARDWARE.md)（英文）。
+不确定自己是什么网卡，或者希望支持别的网卡？[诊断报告](SUPPORT.zh-CN.md#反馈问题诊断报告)不装 nekodrop 也能用：下载 [`installer/report.ps1`](../installer/report.ps1)，运行 `powershell -ExecutionPolicy Bypass -File report.ps1`。它会列出每块无线网卡的 PCI ID、芯片、驱动，以及 nekodrop 为什么能或不能在上面运行；欢迎贴到 [Issues](../../../issues)。已安装 nekodrop 时，运行 `NekoDropService.exe --status` 可查看匹配到的网卡档案、能力与当前驱动提供者，`NekoDropService.exe --selftest` 可在无网卡、无管理员权限下校验全部 24 个活跃网卡档案以及多后端启动参数规划。Intel 的 radio 启动时会记一行 `backend …` 日志并在每次构建时运行 `iwx_selftest`；Realtek 的 radio 构建会同步运行四项离线单测（`block_ack_test`、`reorder_buffer_test`、`outgoing_session_test`、`dma_address_test`）；`install.ps1 -SelfTest`, `restore.ps1 -SelfTest` 和 `report.ps1 -SelfTest` 也会在每次构建时于 Windows PowerShell 5.1 下运行离线自检。支持其他网卡需要做什么，见 [docs/HARDWARE.md](HARDWARE.md)（英文）。
 
 ## 适配新网卡
 

@@ -193,6 +193,11 @@ uint16_t Mt7902::tx_rate_cck(unsigned mbps_x2) {
 
 uint16_t Mt7902::tx_rate_ht(unsigned mcs) { return static_cast<uint16_t>(kPhyTypeHt << 6 | (mcs & 0x3f)); }
 
+uint16_t Mt7902::tx_rate_vht(unsigned mcs, unsigned nss) {
+  const unsigned s = (nss >= 2) ? 1u : 0u;
+  return static_cast<uint16_t>((s << 10) | (kPhyTypeVht << 6) | (mcs & 0xf));
+}
+
 bool Mt7902::channel_switch(uint8_t ext_cmd_id, bool wait) {
   ChanInfo req{};
   req.control_ch = _channel;
@@ -228,15 +233,52 @@ bool Mt7902::sniffer(bool enable) {
 }
 
 bool Mt7902::sniffer_config(bool wait) {
+  using C = std::chrono::steady_clock;
+  const auto us = [](C::time_point a, C::time_point b) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+  };
+  const uint8_t eff_w = _channel == 165 ? 20 : _width;
   SnifferConfig req{};
   req.tag = 1;
   req.len = sizeof(req) - 4;
   req.ch_band = _channel > 14 ? 2 : 1;
-  req.bw = _width == 80 ? 1 : 0;
+  req.bw = eff_w == 80 ? 1 : 0;
   req.control_ch = _channel;
-  req.center_ch = center_channel(_channel, _width);
+  req.center_ch = center_channel(_channel, eff_w);
   req.sco = req.control_ch < req.center_ch ? 1 : req.control_ch > req.center_ch ? 3 : 0;
   req.drop_err = 1;
+  if (is_mt7925()) {
+    struct {
+      uint8_t bss_idx, reserved[3];
+      uint16_t tag, len;
+      uint8_t control, center, center2, bandwidth, tx_streams, rx_streams;
+      uint8_t ht_op, sco, band, pad[3];
+    } rlm{};
+    static_assert(sizeof(rlm) == 20);
+    rlm.bss_idx = kOmacIdx;
+    rlm.tag = 2;
+    rlm.len = sizeof(rlm) - 4;
+    rlm.control = req.control_ch;
+    rlm.center = req.center_ch;
+    rlm.bandwidth = cbw(eff_w);
+    rlm.tx_streams = rlm.rx_streams = 2;
+    rlm.ht_op = eff_w > 20 ? 4 : 0;
+    rlm.sco = req.sco;
+    rlm.band = req.ch_band;
+    const auto t0 = C::now();
+    bool rlm_ok = mcu_send(uni_cmd(kMcuUniBssInfoUpdate), &rlm, sizeof(rlm), wait, nullptr, move_timeout_ms, false);
+    if (rlm_ok && _sta_iface_up) {
+      rlm.bss_idx = kStationOmac;
+      rlm_ok = mcu_send(uni_cmd(kMcuUniBssInfoUpdate), &rlm, sizeof(rlm), wait, nullptr, move_timeout_ms, false);
+    }
+    const auto t1 = C::now();
+    const bool snf_ok = rlm_ok && mcu_send(uni_cmd(kMcuUniSniffer), &req, sizeof(req), wait, nullptr, move_timeout_ms, false);
+    const auto t2 = C::now();
+    last_move_us[0] = us(t0, t1);
+    last_move_us[1] = us(t1, t2);
+    last_move_us[2] = 0;
+    return snf_ok;
+  }
   return mcu_send(uni_cmd(kMcuUniSniffer), &req, sizeof(req), wait);
 }
 
@@ -251,6 +293,7 @@ bool Mt7902::add_omac(uint8_t omac, const uint8_t addr[6], const uint8_t bssid[6
   dev.tag = 0; /* DEV_INFO_ACTIVE */
   dev.len = sizeof(dev) - 4;
   dev.active = enable;
+  dev.link_idx = is_mt7925() ? omac : 0;
   std::memcpy(dev.omac_addr, addr, 6);
   BssBasicReq bss{};
   bss.bss_idx = omac;
@@ -262,14 +305,25 @@ bool Mt7902::add_omac(uint8_t omac, const uint8_t addr[6], const uint8_t bssid[6
   bss.conn_type = kConnectionInfraAp; /* as mt76 for a monitor interface */
   bss.conn_state = 1;
   std::memcpy(bss.bssid, bssid, 6);
-  bss.bmc_tx_wlan_idx = kWcidGlobal;
-  bss.sta_idx = kWcidGlobal;
+  bss.bmc_tx_wlan_idx =
+      is_mt7925() ? (omac ? mt7925::kStationMonitorWcid : mt7925::kMonitorWcid) : kWcidGlobal;
+  bss.sta_idx = bss.bmc_tx_wlan_idx;
   bss.bcn_interval = 100;
   bss.dtim_period = 1;
-  bss.phymode = 0x3f; /* A, B, G, GN, AN, AC */
-  if (enable)
-    return mcu_send(uni_cmd(kMcuUniDevInfoUpdate), &dev, sizeof(dev), true) &&
-           mcu_send(uni_cmd(kMcuUniBssInfoUpdate), &bss, sizeof(bss), true);
+  bss.phymode = 0x3f;
+  if (is_mt7925()) {
+    bss.nonht_basic_phy = _channel > 14 ? 2 : 1; /* PHY_TYPE_OFDM_INDEX on 5 GHz */
+    bss.link_idx = omac;
+  }
+  if (enable) {
+    const bool ok = mcu_send(uni_cmd(kMcuUniDevInfoUpdate), &dev, sizeof(dev), true) &&
+                    mcu_send(uni_cmd(kMcuUniBssInfoUpdate), &bss, sizeof(bss), true);
+    if (ok && is_mt7925()) {
+      (void)set_bss_qos_mt7925(omac);
+      (void)set_edca_mt7925(omac);
+    }
+    return ok;
+  }
   return mcu_send(uni_cmd(kMcuUniBssInfoUpdate), &bss, sizeof(bss), true) &&
          mcu_send(uni_cmd(kMcuUniDevInfoUpdate), &dev, sizeof(dev), true);
 }
@@ -279,6 +333,7 @@ bool Mt7902::radio_start(uint8_t channel, uint8_t width_mhz, const std::string &
   _channel = channel;
   _width = channel > 14 ? width_mhz : 20;
   std::memcpy(_own, _mac, 6);
+  if (is_mt7925()) return start_mt7925_radio(country, error);
 
   /* mt76_connac_mcu_set_deep_sleep(false), as mt7921 does for the MT7902
    * (no runtime PM) and in monitor mode: without it the firmware's power
@@ -350,6 +405,20 @@ bool Mt7902::radio_start(uint8_t channel, uint8_t width_mhz, const std::string &
 }
 
 bool Mt7902::set_channel(uint8_t channel, uint8_t width_mhz) {
+  if (is_mt7925()) {
+    const bool valid5g = (channel >= 36 && channel <= 64 && (channel - 36) % 4 == 0) ||
+                         (channel >= 100 && channel <= 144 && (channel - 100) % 4 == 0) ||
+                         (channel >= 149 && channel <= 165 && (channel - 149) % 4 == 0);
+    if (!valid5g) return false;
+    const auto previous_ch = _channel;
+    const auto previous_w = _width;
+    _channel = channel;
+    _width = channel == 165 ? 20 : (width_mhz == 80 || width_mhz == 40 ? width_mhz : 20);
+    if (sniffer_config(move_wait)) return true;
+    _channel = previous_ch;
+    _width = previous_w;
+    return false;
+  }
   _channel = channel;
   _width = channel > 14 ? width_mhz : 20;
   using C = std::chrono::steady_clock;
@@ -374,6 +443,7 @@ bool Mt7902::set_identity(const uint8_t own[6], const uint8_t bssid[6]) {
   std::memcpy(_own, own, 6);
   std::memcpy(_bssid, bssid, 6);
   _iface_up = add_interface(true);
+  if (_iface_up && is_mt7925()) (void)set_rx_filter_mt7925();
   /* Re-adding the interface may reset the sniffer: put it back. */
   return _iface_up && sniffer(true) && sniffer_config();
 }
@@ -383,6 +453,7 @@ bool Mt7902::set_station_identity(const uint8_t addr[6], const uint8_t bssid[6])
   std::memcpy(_sta_addr, addr, 6);
   std::memcpy(_sta_bssid, bssid, 6);
   _sta_iface_up = add_omac(kStationOmac, _sta_addr, _sta_bssid, true);
+  if (_sta_iface_up && is_mt7925()) (void)set_rx_filter_mt7925();
   return _sta_iface_up && sniffer(true) && sniffer_config();
 }
 
@@ -390,11 +461,12 @@ void Mt7902::clear_station_identity() {
   if (!_sta_iface_up) return;
   add_omac(kStationOmac, _sta_addr, _sta_bssid, false);
   _sta_iface_up = false;
+  if (is_mt7925()) (void)set_rx_filter_mt7925();
   sniffer(true);
   sniffer_config();
 }
 
-int Mt7902::transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t omac) {
+int Mt7902::transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t omac, unsigned attempts) {
   if (len < 10) return -1;
   const uint16_t fc = static_cast<uint16_t>(frame[0] | frame[1] << 8);
   const uint32_t type = (fc >> 2) & 3, subtype = (fc >> 4) & 0xf;
@@ -405,8 +477,13 @@ int Mt7902::transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t om
   if (data && (subtype & 8) && len >= hdrlen) tid = frame[hdrlen - 2] & 0x7;
 
   uint32_t txd[8] = {};
-  uint32_t q = data && !group ? kLmacAc01 : kLmacAltx0;
+  /* On MT7925 monitor mode, frames use kMonitorWcid (bmc_tx_wlan_idx) with no
+   * STA record; kLmacAc01 stalls each packet ~250 ms behind CAB/EDCA gating,
+   * missing the peer's 65 ms AWDL window. kLmacAltx0 transmits immediately
+   * while preserving hardware ACK check, retry count, and fixed-rate table. */
+  uint32_t q = (data && !group && !is_mt7925()) ? kLmacAc01 : kLmacAltx0;
   if (force_altx >= 0) q = force_altx ? kLmacAltx0 : kLmacAc01;
+  if (is_mt7925()) return transmit_mt7925(frame, len, rate, q, omac, attempts);
   txd[0] = static_cast<uint32_t>(len + kTxdSize) | kTxTypeCt << 23 | q << 25;
   txd[1] = kTxd1LongFormat | kWcidGlobal | static_cast<uint32_t>(omac) << 24 |
            kHdrFormat80211 << 16 | static_cast<uint32_t>(hdrlen / 2) << 11 | tid << 20;
@@ -422,10 +499,12 @@ int Mt7902::transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t om
   return queue_frame(frame, len, txd);
 }
 
-int Mt7902::transmit_sta(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t omac) {
+int Mt7902::transmit_sta(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t omac, bool allow_ba,
+                         unsigned attempts) {
+  if (is_mt7925()) return transmit_sta_mt7925(frame, len, wcid, omac, allow_ba, attempts);
   /* mt76_connac2_mac_write_txwi for a station's data: no fixed rate (the
    * firmware's rate control), Block Ack allowed, BE queue. */
-  if (len < 26) return -1;
+  if (len < 26 || attempts < 1 || attempts > 31) return -1;
   const uint16_t fc = static_cast<uint16_t>(frame[0] | frame[1] << 8);
   const uint32_t type = (fc >> 2) & 3, subtype = (fc >> 4) & 0xf;
   const size_t hdrlen = ieee80211_hdrlen(fc);
@@ -437,7 +516,8 @@ int Mt7902::transmit_sta(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t
            static_cast<uint32_t>(hdrlen / 2) << 11 | tid << 20;
   txd[2] = type << 4 | subtype;
   const uint16_t sc = static_cast<uint16_t>(frame[22] | frame[23] << 8);
-  txd[3] = 15u << 11 | kTxd3SnValid | static_cast<uint32_t>(sc >> 4) << 16;
+  txd[3] = (attempts & 0x1fu) << 11 | (allow_ba ? 0u : kTxd3BaDisable) | kTxd3SnValid |
+           static_cast<uint32_t>(sc >> 4) << 16;
   txd[7] = type << 20 | subtype << 16;
   return queue_frame(frame, len, txd);
 }
@@ -454,20 +534,36 @@ int Mt7902::queue_frame(const uint8_t *frame, size_t len, uint32_t txd[8]) {
   std::memcpy(page.va, txd, 8 * sizeof(uint32_t));
   std::memcpy(page.va + kTxdSize, &txp, sizeof(txp));
 
-  /* One descriptor: the TXD+TXP; the card fetches the frame itself. */
+  /* One descriptor: the TXD+TXP; the card fetches the frame itself.
+   * When _tx_slots.size() < r.n (224 < 256), outstanding descriptors can never
+   * reach r.n - 1, avoiding a synchronous UMDF DMA_IDX read per packet. */
   TxRing &r = _tx_data;
-  const unsigned done = rr(0xd4300 + r.hw * 0x10 + 0xc) % r.n;
-  if ((r.head + 1) % r.n == done) return -1;
+  if (!is_mt7925() || _tx_slots.size() >= r.n) {
+    const unsigned done = rr(0xd4300 + r.hw * 0x10 + 0xc) % r.n;
+    if ((r.head + 1) % r.n == done) return -1;
+  }
   volatile Desc *d = reinterpret_cast<volatile Desc *>(r.desc.va) + r.head;
   d->buf0 = static_cast<uint32_t>(page.pa);
   d->buf1 = 0;
   d->info = 0;
+  MemoryBarrier();
   d->ctrl = static_cast<uint32_t>(kTxdSize + sizeof(HwTxp)) << kDescSdLen0Shift | kDescLastSec0;
   r.head = (r.head + 1) % r.n;
   _tx_free_slots.pop_back();
-  MemoryBarrier();
-  wr(0xd4300 + r.hw * 0x10 + 0x8, r.head);
+  if (_tx_batch) {
+    _tx_dirty = true;
+  } else {
+    MemoryBarrier();
+    wr(0xd4300 + r.hw * 0x10 + 0x8, r.head);
+  }
   return _proxy.failed() ? -1 : token;
+}
+
+void Mt7902::flush_tx() {
+  if (!_tx_dirty) return;
+  _tx_dirty = false;
+  MemoryBarrier();
+  wr(0xd4300 + _tx_data.hw * 0x10 + 0x8, _tx_data.head);
 }
 
 void Mt7902::handle_tx_free(const uint8_t *data, size_t len) { /* mt7921_mac_tx_free */
@@ -499,6 +595,10 @@ void Mt7902::handle_rx(const std::vector<uint8_t> &buf) { /* mt7921_queue_rx_skb
   const uint32_t *rxd = reinterpret_cast<const uint32_t *>(buf.data());
   const uint32_t type = rxd[0] >> kRxd0PktTypeShift;
   rx_types[type & 31]++;
+  if (is_mt7925()) {
+    handle_mt7925_rx(buf);
+    return;
+  }
   if (type == kPktTypeTxrxNotify) { /* as short as 16 bytes */
     handle_tx_free(buf.data(), buf.size());
     return;
@@ -541,16 +641,31 @@ void Mt7902::handle_rx(const std::vector<uint8_t> &buf) { /* mt7921_queue_rx_skb
 }
 
 unsigned Mt7902::poll() {
-  unsigned n = 0;
-  while (n < 64 && rx_take(_rx_data, _rx_scratch)) {
-    handle_rx(_rx_scratch);
-    n++;
+  if (!is_mt7925()) {
+    unsigned n = 0;
+    while (n < 64 && rx_take(_rx_data, _rx_scratch)) {
+      handle_rx(_rx_scratch);
+      n++;
+    }
+    while (rx_take(_rx_mcu, _rx_scratch)) {
+      handle_rx(_rx_scratch);
+      n++;
+    }
+    return n;
   }
-  while (rx_take(_rx_mcu, _rx_scratch)) {
+  unsigned data_n = 0;
+  while (data_n < 256 && rx_take(_rx_data, _rx_scratch, true)) {
     handle_rx(_rx_scratch);
-    n++;
+    data_n++;
   }
-  return n;
+  if (data_n) flush_rx(_rx_data);
+  unsigned mcu_n = 0;
+  while (rx_take(_rx_mcu, _rx_scratch, true)) {
+    handle_rx(_rx_scratch);
+    mcu_n++;
+  }
+  if (mcu_n) flush_rx(_rx_mcu);
+  return data_n + mcu_n;
 }
 
 std::string Mt7902::tx_ring_state() {

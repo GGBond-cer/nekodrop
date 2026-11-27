@@ -20,7 +20,7 @@ class Mt7902 {
 public:
   using Logger = std::function<void(const std::string &)>;
 
-  Mt7902() = default;
+  explicit Mt7902(bool probe_mt7925 = false) : _probe_mt7925(probe_mt7925) {}
   ~Mt7902();
   Mt7902(const Mt7902 &) = delete;
   Mt7902 &operator=(const Mt7902 &) = delete;
@@ -36,6 +36,7 @@ public:
   void close();
 
   uint16_t chip_id() const { return _chip; }
+  bool is_mt7925() const { return _probe_mt7925; }
   uint8_t chip_rev() const { return _rev; }
   const uint8_t *mac_address() const { return _mac; }
   const std::string &firmware_version() const { return _fw_version; }
@@ -103,6 +104,7 @@ public:
   /* How long a move waits for the firmware's answer: now and then it takes
    * a third of a second, longer than a router lets a station be away. */
   unsigned move_timeout_ms = 3000;
+  bool he80 = false;
   uint64_t last_move_us[3] = {};
   /* The address the card acknowledges unicast frames for, and the BSSID of
    * its (ad-hoc) interface. */
@@ -115,10 +117,21 @@ public:
   /* Queues one 802.11 frame (no FCS) at `rate` (TXD rate value, see
    * tx_rate_*), from own MAC `omac`. Returns its token (named again in the
    * TX status), or -1 when every TX slot is still out or the ring is full. */
-  int transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t omac = 0);
+  int transmit(const uint8_t *frame, size_t len, uint16_t rate, uint8_t omac = 0, unsigned attempts = 15);
   /* Test knobs for transmit(): -1 keeps the default. */
-  int force_no_ack = -1, force_altx = -1;
+  int force_no_ack = -1, force_altx = -1, force_bw = -1;
   unsigned tx_slots_free() const { return static_cast<unsigned>(_tx_free_slots.size()); }
+  void reclaim_token(uint16_t token) {
+    if (token < _tx_slots.size() &&
+        std::find(_tx_free_slots.begin(), _tx_free_slots.end(), token) == _tx_free_slots.end()) {
+      _tx_free_slots.push_back(token);
+    }
+  }
+  void set_tx_batch(bool on) {
+    _tx_batch = on;
+    if (!on) flush_tx();
+  }
+  void flush_tx();
   /* Drains the RX rings and the firmware's TX-done reports. Returns frames handled. */
   unsigned poll();
   uint8_t channel() const { return _channel; }
@@ -148,14 +161,16 @@ public:
   bool sta_add(uint8_t wcid, const uint8_t peer[6], const PeerCaps &caps, uint8_t omac = 0);
   bool sta_remove(uint8_t wcid, const uint8_t peer[6], uint8_t omac = 0);
   bool sta_ba(uint8_t wcid, const uint8_t peer[6], uint8_t tid, uint16_t ssn, uint16_t win, bool tx, bool enable,
-              uint8_t omac = 0);
+              uint8_t omac = 0, bool amsdu = false);
   /* A QoS data frame to a peer station: the firmware's rate, Block Ack
-   * allowed, the frame's own sequence number kept. Token or -1. */
-  int transmit_sta(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t omac = 0);
+   * allowed when `allow_ba`, the frame's own sequence number kept. Token or -1. */
+  int transmit_sta(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t omac = 0, bool allow_ba = true,
+                   unsigned attempts = 15);
 
   static uint16_t tx_rate_ofdm(unsigned mbps);
   static uint16_t tx_rate_cck(unsigned mbps_x2);
   static uint16_t tx_rate_ht(unsigned mcs);
+  static uint16_t tx_rate_vht(unsigned mcs, unsigned nss = 1);
   bool mcu_send(const Command &cmd, const void *data, size_t len, bool wait,
                 std::vector<uint8_t> *answer = nullptr, unsigned timeout_ms = 3000, bool log_timeout = true);
 
@@ -195,18 +210,24 @@ private:
   /* Queues one buffer on a TX ring and rings the doorbell. */
   bool tx_raw(TxRing &r, const void *data, size_t len, unsigned timeout_ms = 1000);
   /* One complete frame from an RX ring (segments joined), or false if none. */
-  bool rx_take(RxRing &r, std::vector<uint8_t> &out);
+  bool rx_take(RxRing &r, std::vector<uint8_t> &out, bool defer_refill = false);
+  void flush_rx(RxRing &r);
 
   bool send_patch(const std::vector<uint8_t> &fw, std::string &error);
   bool send_ram(const std::vector<uint8_t> &fw, std::string &error);
   bool init_download(uint32_t addr, uint32_t len, uint32_t mode);
   bool send_scatter(const uint8_t *data, size_t len);
   int patch_sem(bool get);
+  bool reset_wfsys();
+  size_t mcu_rx_header_size() const;
+  const char *chip_name() const { return _probe_mt7925 ? "mt7925" : "mt7902"; }
 
   /* The pool outlives the proxy handle: closing the handle runs the close ops
    * that stop the card's DMA, and only then are its pages given back. */
   DmaPool _pool;
   RegProxy _proxy;
+  const bool _probe_mt7925 = false;
+  bool _owned = false;
   Logger _log;
   EventHandler _on_event;
   uint32_t _l1_base = 0xffffffff; /* last L1 window programmed */
@@ -216,11 +237,25 @@ private:
   uint8_t _mac[6] = {};
   std::string _fw_version;
   bool _dma_on = false;
+  bool _tx_batch = false, _tx_dirty = false;
 
   TxRing _tx_data, _tx_mcu, _tx_fwdl;
   RxRing _rx_mcu, _rx_data;
 
   /* Radio state */
+  bool start_mt7925_radio(const std::string &country, std::string &error);
+  bool set_rx_filter_mt7925();
+  bool set_bss_qos_mt7925(uint8_t bss_idx);
+  bool set_edca_mt7925(uint8_t bss_idx);
+  bool sta_add_mt7925(uint8_t wcid, const uint8_t peer[6], const PeerCaps &caps, uint8_t omac);
+  bool sta_remove_mt7925(uint8_t wcid, const uint8_t peer[6], uint8_t omac);
+  bool sta_ba_mt7925(uint8_t wcid, uint8_t tid, uint16_t ssn, uint16_t win, bool tx, bool enable, uint8_t omac,
+                     bool amsdu);
+  int transmit_sta_mt7925(const uint8_t *frame, size_t len, uint8_t wcid, uint8_t omac, bool allow_ba,
+                          unsigned attempts);
+  int transmit_mt7925(const uint8_t *frame, size_t len, uint16_t rate, uint32_t queue, uint8_t omac,
+                      unsigned attempts);
+  void handle_mt7925_rx(const std::vector<uint8_t> &buf);
   void handle_rx(const std::vector<uint8_t> &buf);
   void handle_tx_free(const uint8_t *data, size_t len);
   bool add_interface(bool enable);
@@ -244,4 +279,5 @@ private:
   uint8_t _sta_addr[6] = {}, _sta_bssid[6] = {};
   bool _sta_iface_up = false;
   std::vector<uint8_t> _rx_scratch;
+  std::vector<uint8_t> _rx_unpad;
 };

@@ -56,6 +56,7 @@
 #include "mt_station.h"
 #include "pipe_server.h"
 #include "radio_link.h"
+#include "rx_ba_reorder.h"
 #include "wifi_sta.h"
 
 namespace {
@@ -89,12 +90,14 @@ BOOL WINAPI on_console(DWORD) {
 }
 
 void say(const char *f, ...) {
+  static const auto start = Clock::now();
+  const double sec = std::chrono::duration<double>(Clock::now() - start).count();
   char line[600];
   va_list a;
   va_start(a, f);
   std::vsnprintf(line, sizeof(line), f, a);
   va_end(a);
-  std::printf("radio: %s\n", line);
+  std::printf("[+%07.3fs] radio: %s\n", sec, line);
   std::fflush(stdout);
 }
 
@@ -104,7 +107,7 @@ std::string mac_str(const uint8_t *m) {
   return s;
 }
 
-std::string find_firmware_dir() {
+std::string find_firmware_dir(bool mt7925 = false) {
   namespace fs = std::filesystem;
   std::error_code ec;
   /* Beside the program first (an installed nekodrop ships it), then the
@@ -112,6 +115,12 @@ std::string find_firmware_dir() {
   wchar_t self[MAX_PATH];
   GetModuleFileNameW(nullptr, self, MAX_PATH);
   const fs::path local = fs::path(self).parent_path() / "firmware";
+  if (mt7925) {
+    if (fs::exists(local / mt::mt7925::kRamFile, ec) &&
+        fs::exists(local / mt::mt7925::kPatchFile, ec))
+      return local.string();
+    return {};
+  }
   if (fs::exists(local / "WIFI_RAM_CODE_MT7902_1.bin", ec)) return local.string();
   fs::path best;
   fs::file_time_type best_time{};
@@ -134,8 +143,11 @@ struct Options {
   std::string country = "CN";
   std::string fw_dir;
   std::string data_rate = "auto";
+  bool mt7925 = false;
   bool aggregate = true;
-  unsigned test_rx = 0, test_tx = 0, test_kinds = 0, test_sta = 0, test_switch = 0, run_for = 0;
+  bool he80 = false;
+  bool trace_tcp = false;
+  unsigned test_rx = 0, test_tx = 0, test_broadcast = 0, test_kinds = 0, test_sta = 0, test_switch = 0, run_for = 0;
   bool test_scan = false;
   int only = -1;
   std::string sta_config;
@@ -144,9 +156,12 @@ struct Options {
 std::optional<Options> parse(int argc, char **argv) {
   if (argc < 2) return std::nullopt;
   Options o;
+  if (const char *env = std::getenv("NEKODROP_TRACE_AWDL_TCP"))
+    o.trace_tcp = env[0] == '1' || env[0] == 't' || env[0] == 'T';
   const int ch = std::atoi(argv[1]);
   if (ch < 1 || ch > 177) return std::nullopt;
   o.channel = static_cast<uint8_t>(ch);
+  bool agg_set = false;
   for (int i = 2; i < argc; i++) {
     const std::string a = argv[i];
     const bool more = i + 1 < argc;
@@ -154,9 +169,14 @@ std::optional<Options> parse(int argc, char **argv) {
     else if (a == "--country" && more) o.country = argv[++i];
     else if (a == "--fw-dir" && more) o.fw_dir = argv[++i];
     else if (a == "--data-rate" && more) o.data_rate = argv[++i];
-    else if (a == "--no-agg") o.aggregate = false;
+    else if (a == "--mt7925") o.mt7925 = true;
+    else if (a == "--he80") o.he80 = true;
+    else if (a == "--agg") { o.aggregate = true; agg_set = true; }
+    else if (a == "--no-agg") { o.aggregate = false; agg_set = true; }
+    else if (a == "--trace-awdl-tcp") o.trace_tcp = true;
     else if (a == "--test-rx" && more) o.test_rx = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (a == "--test-tx" && more) o.test_tx = static_cast<unsigned>(std::atoi(argv[++i]));
+    else if (a == "--test-broadcast" && more) o.test_broadcast = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (a == "--test-kinds" && more) o.test_kinds = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (a == "--only" && more) o.only = std::atoi(argv[++i]);
     else if (a == "--test-sta" && more) o.test_sta = static_cast<unsigned>(std::atoi(argv[++i]));
@@ -165,6 +185,15 @@ std::optional<Options> parse(int argc, char **argv) {
     else if (a == "--run-for" && more) o.run_for = static_cast<unsigned>(std::atoi(argv[++i]));
     else if (a == "--sta-config" && more) o.sta_config = argv[++i];
     else return std::nullopt;
+  }
+  if (o.mt7925) {
+    const bool ok5g = (o.channel >= 36 && o.channel <= 64 && (o.channel - 36) % 4 == 0) ||
+                      (o.channel >= 100 && o.channel <= 144 && (o.channel - 100) % 4 == 0) ||
+                      (o.channel >= 149 && o.channel <= 165 && (o.channel - 149) % 4 == 0);
+    if (!ok5g || (o.width && o.width != 20 && o.width != 40 && o.width != 80))
+      return std::nullopt;
+    if (o.width == 0) o.width = o.channel == 165 ? 20 : 80;
+    (void)agg_set;
   }
   if (o.width == 0) o.width = o.channel > 14 ? 80 : 20;
   if (o.width != 20 && o.width != 40 && o.width != 80) return std::nullopt;
@@ -188,20 +217,52 @@ bool is_awdl(const uint8_t *f, size_t len) {
          f[27] == 0xf2 && f[28] == 0x08;
 }
 
+using AwDlTcp = awdl::TcpSegment;
+
+std::optional<AwDlTcp> awdl_tcp(const uint8_t *frame, size_t length) {
+  AwDlTcp out;
+  if (!awdl::parse_awdl_tcp(frame, length, out)) return std::nullopt;
+  return out;
+}
+
 /* Rates unicast data may go at, slowest first. */
 struct RateLadder {
   std::vector<std::pair<std::string, uint16_t>> levels;
   size_t level = 0;
-  unsigned sent = 0, failed = 0;
+  unsigned sent = 0, failed = 0, consec_failed = 0;
+  bool gentle_cliff = false;
   uint64_t up = 0, down = 0;
   void result(bool acked) {
     sent++;
-    failed += !acked;
-    if (sent < 32) return;
-    if (failed * 100 / sent > 30 && level > 0) {
+    if (!gentle_cliff) {
+      failed += !acked;
+      if (sent < 32) return;
+      if (failed * 100 / sent > 30 && level > 0) {
+        level--;
+        down++;
+      } else if (failed * 100 / sent < 8 && level + 1 < levels.size()) {
+        level++;
+        up++;
+      }
+      sent = failed = 0;
+      return;
+    }
+    if (acked) {
+      consec_failed = 0;
+    } else {
+      failed++;
+      if (++consec_failed >= 8u && level > 0) {
+        level--;
+        down++;
+        sent = failed = consec_failed = 0;
+        return;
+      }
+    }
+    if (sent < 16) return;
+    if (failed * 100 / sent > 25 && level > 0) {
       level--;
       down++;
-    } else if (failed * 100 / sent < 8 && level + 1 < levels.size()) {
+    } else if (failed * 100 / sent < 10 && level + 1 < levels.size()) {
       level++;
       up++;
     }
@@ -209,9 +270,12 @@ struct RateLadder {
   }
 };
 
-RateLadder make_ladder(const std::string &spec) {
+RateLadder make_ladder(const std::string &spec, bool mt7925 = false, uint8_t width = 80) {
   RateLadder l;
+  l.gentle_cliff = mt7925;
   auto named = [](const std::string &s) -> std::optional<std::pair<std::string, uint16_t>> {
+    if (s.rfind("VHT2S", 0) == 0) return std::make_pair(s, Mt7902::tx_rate_vht(std::atoi(s.c_str() + 5), 2));
+    if (s.rfind("VHT1S", 0) == 0) return std::make_pair(s, Mt7902::tx_rate_vht(std::atoi(s.c_str() + 5), 1));
     if (s.rfind("MCS", 0) == 0) return std::make_pair(s, Mt7902::tx_rate_ht(std::atoi(s.c_str() + 3)));
     if (s.rfind("OFDM", 0) == 0) return std::make_pair(s, Mt7902::tx_rate_ofdm(std::atoi(s.c_str() + 4)));
     return std::nullopt;
@@ -220,9 +284,21 @@ RateLadder make_ladder(const std::string &spec) {
     if (auto r = named(spec)) l.levels.push_back(*r);
   }
   if (l.levels.empty()) {
-    /* What iPhones were measured to receive on other backends (winawdl's ladder). */
-    for (const char *s : {"OFDM24", "MCS2", "MCS4", "MCS5", "MCS7"}) l.levels.push_back(*named(s));
-    l.level = 2;
+    if (mt7925) {
+      for (const char *s : {"OFDM6", "OFDM12", "OFDM24", "OFDM36", "OFDM48", "MCS4", "MCS6", "MCS7"})
+        l.levels.push_back(*named(s));
+      if (width >= 80) {
+        for (const char *s : {"VHT1S4", "VHT1S6", "VHT1S7", "VHT1S8", "VHT2S6", "VHT2S7", "VHT2S8"})
+          l.levels.push_back(*named(s));
+        l.level = 5; /* Start bulk 80 MHz transfers at MCS4 and ramp into VHT80 1SS/2SS within ~100 frames */
+      } else {
+        l.level = 3;
+      }
+    } else {
+      /* What iPhones were measured to receive on other backends (winawdl's ladder). */
+      for (const char *s : {"OFDM24", "MCS2", "MCS4", "MCS5", "MCS7"}) l.levels.push_back(*named(s));
+      l.level = 2;
+    }
   }
   return l;
 }
@@ -340,18 +416,14 @@ constexpr uint8_t kNoPeerAway[16] = {0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
 
 class Relay {
 public:
-  Relay(Mt7902 &dev, PipeServer &pipe, RateLadder ladder) : _dev(dev), _pipe(pipe), _ladder(std::move(ladder)) {
+  Relay(Mt7902 &dev, PipeServer &pipe, RateLadder ladder, bool trace_tcp = false)
+      : _dev(dev), _pipe(pipe), _ladder(std::move(ladder)), _trace_tcp(trace_tcp) {
     /* Channel moves (scans, the station's time sharing, AWDL's channel)
-     * retune the RF only: with the sniffer's own channel too a move took
-     * 21 ms (median) and up to 0.36 s, which a router took for a lost
-     * station; without it 10.5 ms, at most 11.6 ms, and the card hears the
-     * new channel. Not waiting for the firmware's answer left it on the old
-     * channel (--test-switch, --test-scan, 2026-11-24). */
+     * retune the RF only on MT7902; MT7925 switches via sniffer_config. */
     dev.move_sniffer = false;
-    /* The answer comes in ~10 ms; now and then not for 0.35 s, so a move
-     * goes on after 60 ms (the switch itself still happens). */
-    dev.move_timeout_ms = 60;
+    dev.move_timeout_ms = dev.is_mt7925() ? 500 : 60;
     dev.sta_cmd_timeout_ms = 500;
+    dev.set_tx_batch(true);
     dev.set_rx_handler([this](const Mt7902::RxFrame &f) { on_rx(f); });
     dev.set_tx_status_handler([this](unsigned token, bool acked, unsigned tries) { on_tx_status(token, acked, tries); });
   }
@@ -362,6 +434,20 @@ public:
   }
 
   static constexpr unsigned kReservedSlots = 16;
+  static constexpr size_t kMaxCtrlLane = 512;
+  static constexpr size_t kMaxDataLane = 4096;
+  static constexpr unsigned kMt7925UnicastSlots = 48;
+  static constexpr unsigned kMt7925BaUnicastSlots = 60;
+  static constexpr unsigned kMt7925MaxRetryInflight = 24;
+  static constexpr size_t kMaxWindowRetryQueue = 256;
+  static constexpr unsigned kMt7925TxAttempts = 4;
+  static constexpr unsigned kMt7925StaTxAttempts = 10;
+  static constexpr unsigned kMt7925RetryTxAttempts = 4;
+  static constexpr unsigned kPeerRetryAttempts = 120;
+  static constexpr auto kPeerRetryLifetime = std::chrono::milliseconds(3500);
+  static constexpr auto kPeerRetrySpacing = std::chrono::milliseconds(4);
+  static constexpr auto kMaxGateHold = std::chrono::milliseconds(540);
+  static constexpr auto kGateHoldOff = std::chrono::milliseconds(25);
 
   /* A TX message whose frame is data to one station. */
   static bool is_unicast_data(const ClientMsg &m) {
@@ -375,6 +461,7 @@ public:
   void client_gone() {
     std::lock_guard<std::mutex> lock(_mutex);
     _queue.clear();
+    _client_reset = true;
   }
 
   /* Starts the Wi-Fi station beside AWDL (Concurrent mode). */
@@ -385,8 +472,8 @@ public:
     if (cfg.channel <= 14) {
       /* The card completes no frame that waits for an acknowledgement on
        * 2.4 GHz (--test-kinds), and a station's every frame does. */
-      say("station: \"%s\" is on 2.4 GHz (channel %u); the MT7902 joins only 5 GHz networks beside AirDrop",
-          cfg.ssid.c_str(), cfg.channel);
+      say("station: \"%s\" is on 2.4 GHz (channel %u); the %s joins only 5 GHz networks beside AirDrop",
+          cfg.ssid.c_str(), cfg.channel, _dev.is_mt7925() ? "MT7925" : "MT7902");
       say("event: wifi failed");
       return false;
     }
@@ -408,60 +495,113 @@ public:
 
   /* The card's thread. */
   void run() {
-    auto last_report = Clock::now();
+    auto last_report = Clock::now(), last_peer_maint = last_report;
     unsigned idle = 0;
-    /* Three lanes: AWDL's own frames (action frames carrying the sync
-     * timestamps, multicast, settings) never wait behind a burst of unicast
-     * data, and data never takes the last kReservedSlots TX slots. Late
-     * sync frames make an iPhone drop us from AWDL mid-transfer. Local
-     * messages (settings, the station's Ethernet frames, scans) never wait
-     * for AWDL frames, which wait while the card is with the router. */
     std::deque<ClientMsg> ctrl, data, local;
     while (!g_stop) {
       {
         std::lock_guard<std::mutex> lock(_mutex);
-        while (!_queue.empty() && ctrl.size() + data.size() + local.size() < 1024) {
-          ClientMsg &m = _queue.front();
-          if (m.type != RADIO_LINK_TX) local.push_back(std::move(m));
-          else (is_unicast_data(m) ? data : ctrl).push_back(std::move(m));
+        if (_client_reset) {
+          ctrl.clear();
+          data.clear();
+          local.clear();
+          clear_retry_frames();
+          _client_reset = false;
+        }
+        while (!_queue.empty()) {
+          ClientMsg m = std::move(_queue.front());
           _queue.pop_front();
+          if (m.type != RADIO_LINK_TX) {
+            local.push_back(std::move(m));
+          } else if (is_unicast_data(m)) {
+            if (data.size() < kMaxDataLane) data.push_back(std::move(m));
+            else ++_tx_refused;
+          } else {
+            if (ctrl.size() >= kMaxCtrlLane) ctrl.pop_front();
+            ctrl.push_back(std::move(m));
+          }
         }
       }
       unsigned did = 0;
+      {
+        ClientMsg shm_msg{RADIO_LINK_TX, {}};
+        while (data.size() < kMaxDataLane && _pipe.pop_shm_tx(shm_msg.payload)) {
+          shm_msg.at = Clock::now();
+          if (is_unicast_data(shm_msg)) {
+            data.push_back(std::move(shm_msg));
+          } else {
+            if (ctrl.size() >= kMaxCtrlLane) ctrl.pop_front();
+            ctrl.push_back(std::move(shm_msg));
+          }
+          shm_msg.payload.clear();
+          did++;
+        }
+      }
+      auto last_busy_check = Clock::now();
       while (!local.empty()) {
         handle(local.front());
         local.pop_front();
         did++;
       }
+      _dev.flush_tx();
       did += schedule();
-      if (_dev.channel() == channel && !_scan.active) {
+      _dev.flush_tx();
+      if (on_awdl_air()) {
         while (!ctrl.empty()) {
-          /* Held while the card was away: its sync timestamps are stale. */
-          if (Clock::now() - ctrl.front().at > std::chrono::milliseconds(40)) {
+          if ((!_dev.is_mt7925() || _sta) && Clock::now() - ctrl.front().at > std::chrono::milliseconds(40)) {
             ctrl.pop_front();
             _tx_stale++;
             continue;
           }
-          if (!handle(ctrl.front())) break; /* no TX slot: try again after polling */
+          if (!handle(ctrl.front())) break;
           ctrl.pop_front();
           did++;
         }
-        while (!data.empty() && _dev.tx_slots_free() > kReservedSlots) {
+        _dev.flush_tx();
+        did += _dev.poll();
+        while (data_slot_available() && retry_awake_frames()) did++;
+        _dev.flush_tx();
+        unsigned burst = 0;
+        while (!data.empty()) {
+          if (is_client_data_acked(data.front())) {
+            data.pop_front();
+            ++_zombie_purged;
+            did++;
+            continue;
+          }
+          const auto now = Clock::now();
+          if (!data_slot_available(&data.front(), now)) break;
+          if (has_earlier_flow_retry(data.front())) break;
+          if (!can_send_client_data(data.front(), now)) {
+            ++_window_holds;
+            break;
+          }
           if (!handle(data.front())) break;
           data.pop_front();
           did++;
+          if (++burst >= 64) {
+            _dev.flush_tx();
+            burst = 0;
+          }
         }
+        _dev.flush_tx();
       } else {
         while (ctrl.size() > 256) {
           ctrl.pop_front();
           _tx_stale++;
         }
+        did += _dev.poll();
       }
-      did += _dev.poll();
-      if (_sta) did += station_tick();
+      if (_sta) {
+        did += station_tick();
+        _dev.flush_tx();
+      }
+      if (_rx_ba_sessions > 0) {
+        _rx_reorder.flush_expired(now_us(), [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+          queue_rx_to_client(d, l, dbm);
+        });
+      }
       if (_pipe.connected()) _pipe.flush_send();
-      /* Every TX slot out for seconds: the card stopped reporting sent
-       * frames, and nothing more can go out. */
       if (_dev.tx_slots_free() == 0) {
         if (_stalled_since == Clock::time_point{}) _stalled_since = Clock::now();
         else if (Clock::now() - _stalled_since > std::chrono::seconds(3) && !g_card_dead) {
@@ -479,9 +619,23 @@ public:
       } else {
         _stalled_since = Clock::time_point{};
       }
-      if (did) idle = 0;
-      else if (++idle > 200) Sleep(1);
-      else SwitchToThread();
+      last_busy_check = Clock::now();
+      if (did) {
+        idle = 0;
+        _last_busy_at = last_busy_check;
+      } else if (_mt7925_unicast_inflight > 0 || !data.empty() ||
+                 (_last_busy_at != Clock::time_point{} &&
+                  last_busy_check - _last_busy_at < std::chrono::milliseconds(80))) {
+        YieldProcessor();
+      } else if (++idle > 200) {
+        Sleep(1);
+      } else {
+        SwitchToThread();
+      }
+      if (Clock::now() - last_peer_maint > std::chrono::milliseconds(250)) {
+        maintain_peers(now_us(), data.empty());
+        last_peer_maint = Clock::now();
+      }
       if (Clock::now() - last_report > std::chrono::seconds(10)) {
         report();
         last_report = Clock::now();
@@ -497,6 +651,11 @@ public:
         _tx_failed, _tx_refused, _ladder.levels[_ladder.level].first.c_str(), _ladder.up, _ladder.down,
         _addba_declined, static_cast<unsigned>(_peers.size()), _tx_sta, _rx_ba_sessions, _tx_ba_sessions,
         _rx_to_us_pm);
+    if (_dev.is_mt7925())
+      say("unicast data TX completions: %llu ACKed, %llu failed; peer-window retries %llu sent, %llu ACKed, "
+          "%llu ack-purged, %llu expired; off-window holds %llu; slot-follow ch %u moves %llu (%llu us avg)",
+          _unicast_acked, _unicast_failed, _window_retries, _window_retry_acked,
+          _zombie_purged, _retry_expired, _window_holds, _follow_ch, _moves, _moves ? _move_us / _moves : 0ull);
     if (_sta) {
       const MtStation::Stats &s = _sta_dev->stats();
       unsigned router = 0;
@@ -549,12 +708,19 @@ private:
 
   bool station_on_air() const { return _sta && _sta_dev->joined(); }
 
+  bool on_awdl_air() const {
+    if (_scan.active) return false;
+    const uint8_t at = _dev.channel();
+    return at == channel || (_follow_ch != 0 && at == _follow_ch);
+  }
+
   /* The channel the card should be on now, and moves it there. */
   unsigned schedule() {
     if (_scan.active) return scan_step();
     uint8_t want = channel, want_w = width;
     _timeshare = false;
     if (station_on_air()) {
+      _follow_ch = 0;
       const uint8_t s = _sta_dev->channel();
       const WifiStation::State st = _sta->state();
       const bool joining = st == WifiStation::State::Listening || st == WifiStation::State::Authenticating ||
@@ -582,6 +748,54 @@ private:
           want_w = _sta_dev->width();
         }
       }
+    } else if (_dev.is_mt7925() && channel > 14 && _last_awdl_data_us &&
+               now_us() - _last_awdl_data_us < 3000000ull && !_peer_windows.empty()) {
+      const auto now = Clock::now();
+      uint8_t chosen_alt = 0;
+      uint8_t away[16] = {};
+      awdl::PeerTxWindow active_w{};
+      uint64_t best_score = 0;
+      for (const auto &kv : _peer_windows) {
+        const Peer *peer = find_peer_const(kv.first.data());
+        if (!_peers.empty() && peer == nullptr) continue;
+        awdl::PeerTxWindow w = kv.second;
+        if (w.sampled == Clock::time_point{}) w.inherit_sync(_master_sync);
+        if (!w.valid(now)) continue;
+        uint8_t cand_away[16] = {};
+        const uint8_t alt = w.secondary_5g_channel(channel, cand_away);
+        if (alt == 0) continue;
+        const uint64_t score = (kv.first == _last_active_peer ? (1ull << 62) : 0ull) +
+                               (peer ? peer->last_active_us : 1ull);
+        if (chosen_alt == 0 || score > best_score) {
+          chosen_alt = alt;
+          active_w = w;
+          best_score = score;
+          std::memcpy(away, cand_away, 16);
+        }
+      }
+      if (chosen_alt != 0) {
+        if (_follow_ch != chosen_alt) {
+          _follow_ch = chosen_alt;
+          say("slot-follow: dual-channel AWDL active across channels %u and %u (%u MHz)", channel, _follow_ch, width);
+        }
+        std::memcpy(_follow_away, away, 16);
+        want = active_w.desired_channel_at(now, channel, _follow_ch);
+        want_w = want == 165 ? 20 : width;
+        if (want != _dev.channel() && _mt7925_unicast_inflight > 0) {
+          if (_follow_drain_since == Clock::time_point{}) {
+            _follow_drain_since = now;
+            return 0;
+          }
+          if (now - _follow_drain_since < std::chrono::milliseconds(8)) return 0;
+        }
+        _follow_drain_since = {};
+      } else {
+        _follow_ch = 0;
+        _follow_drain_since = {};
+      }
+    } else {
+      _follow_ch = 0;
+      _follow_drain_since = {};
     }
     return move_to(want, want > 14 ? want_w : 20);
   }
@@ -670,7 +884,8 @@ private:
     for (uint8_t c = 36; c <= 64; c += 4) _scan.channels.push_back(c);
     for (uint8_t c = 100; c <= 144; c += 4) _scan.channels.push_back(c);
     for (uint8_t c = 149; c <= 165; c += 4) _scan.channels.push_back(c);
-    for (uint8_t c = 1; c <= 13; c++) _scan.channels.push_back(c);
+    if (!_dev.is_mt7925())
+      for (uint8_t c = 1; c <= 13; c++) _scan.channels.push_back(c);
     say("event: scan-started");
   }
 
@@ -803,6 +1018,7 @@ private:
       adopt_identity();
     } else if (m.type == RADIO_LINK_SET_CHANNEL && m.payload.size() == 1 && m.payload[0] != channel) {
       /* AWDL's channel: the scheduler takes the card there. */
+      clear_retry_frames();
       say("channel %u -> %u", channel, m.payload[0]);
       channel = m.payload[0];
     }
@@ -811,12 +1027,117 @@ private:
 
   void adopt_identity() {
     if (!_own_set) return;
+    clear_retry_frames();
+    _rx_reorder.clear();
     _peers.clear(); /* re-adding the interface drops its stations */
     const Mac bssid = _bssid_set ? _bssid : Mac{kAwdlBssid[0], kAwdlBssid[1], kAwdlBssid[2], kAwdlBssid[3], kAwdlBssid[4], kAwdlBssid[5]};
     if (_dev.set_identity(_own.data(), bssid.data()))
       say("acknowledging frames for %s (BSSID %s)", mac_str(_own.data()).c_str(), mac_str(bssid.data()).c_str());
     else
       say("the card will not acknowledge frames for the client; peers will repeat everything they send it");
+  }
+
+  unsigned mt7925_allowed_inflight(const ClientMsg *next, Clock::time_point now) const {
+    if (!_dev.is_mt7925()) return 1024;
+    if (!next) return kMt7925UnicastSlots;
+    const uint8_t *f = nullptr;
+    size_t len = 0;
+    if (!extract_client_frame(*next, f, len) || std::memcmp(f + 16, kAwdlBssid, 6) != 0)
+      return kMt7925UnicastSlots;
+    Mac dst{};
+    std::memcpy(dst.data(), f + 4, 6);
+    const Peer *peer = find_peer_const(dst.data());
+    const unsigned cap = (peer && peer->tx_ba) ? kMt7925BaUnicastSlots : kMt7925UnicastSlots;
+    const auto it = _peer_windows.find(dst);
+    if (it == _peer_windows.end()) return cap;
+    awdl::PeerTxWindow w = it->second;
+    if (w.sampled == Clock::time_point{}) w.inherit_sync(_master_sync);
+    const uint8_t cur_ch = _dev.channel();
+    if (!w.valid(now) || !w.has_channel(cur_ch)) return cap;
+    const unsigned rec = w.recommended_inflight(now, cur_ch, cap);
+    if (rec == 0 && now < _hold_off_until) return 2u;
+    return rec > 0 ? rec : 1u;
+  }
+
+  bool data_slot_available(const ClientMsg *next = nullptr, Clock::time_point now = Clock::now()) const {
+    return _dev.tx_slots_free() > kReservedSlots &&
+           (!_dev.is_mt7925() || _mt7925_unicast_inflight < mt7925_allowed_inflight(next, now));
+  }
+
+  static bool extract_client_frame(const ClientMsg &m, const uint8_t *&f, size_t &len) {
+    if (m.type != RADIO_LINK_TX || m.payload.size() < 4) return false;
+    const size_t rt = m.payload[2] | static_cast<size_t>(m.payload[3]) << 8;
+    if (rt >= m.payload.size() || m.payload.size() - rt < 24) return false;
+    f = m.payload.data() + rt;
+    len = m.payload.size() - rt;
+    return true;
+  }
+
+  bool has_earlier_flow_retry(const ClientMsg &m) const {
+    if (_window_retry_queue.empty()) return false;
+    const uint8_t *f = nullptr;
+    size_t len = 0;
+    AwDlTcp tcp;
+    if (!extract_client_frame(m, f, len) || !awdl::parse_awdl_tcp(f, len, tcp) ||
+        tcp.payload_bytes == 0)
+      return false;
+    const uint32_t key = awdl::TcpAckTracker::flow_key(tcp.source, tcp.destination);
+    for (const auto &r : _window_retry_queue) {
+      AwDlTcp pending;
+      if (awdl::parse_awdl_tcp(r.bytes.data(), r.bytes.size(), pending) &&
+          pending.payload_bytes > 0 && (pending.flags & 0x05u) == 0 &&
+          awdl::TcpAckTracker::flow_key(pending.source, pending.destination) == key &&
+          awdl::tcp_seq_gt(tcp.sequence, pending.sequence)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool is_client_data_acked(const ClientMsg &m) const {
+    if (!_dev.is_mt7925()) return false;
+    const uint8_t *f = nullptr;
+    size_t len = 0;
+    return extract_client_frame(m, f, len) && _tcp_acks.is_outbound_acked(f, len);
+  }
+
+  bool can_send_client_data(const ClientMsg &m, Clock::time_point now) {
+    if (!_dev.is_mt7925()) return true;
+    const uint8_t *f = nullptr;
+    size_t len = 0;
+    if (!extract_client_frame(m, f, len)) return true;
+    if (std::memcmp(f + 16, kAwdlBssid, 6) != 0) return true;
+    Mac dst{};
+    std::memcpy(dst.data(), f + 4, 6);
+    const auto it = _peer_windows.find(dst);
+    if (it == _peer_windows.end()) return true;
+    awdl::PeerTxWindow w = it->second;
+    if (w.sampled == Clock::time_point{}) w.inherit_sync(_master_sync);
+    const uint8_t cur_ch = _dev.channel();
+    if (!w.valid(now) || !w.has_channel(cur_ch)) {
+      _hold_since = {};
+      return true;
+    }
+    if (w.can_send(now, cur_ch, false)) {
+      _hold_since = {};
+      return true;
+    }
+    if (_follow_ch != 0 && w.has_channel(channel) && w.has_channel(_follow_ch)) {
+      /* When dual-channel slot following is active, hold cleanly across the
+       * 15 ms RF switch instead of spilling frames onto the wrong channel. */
+      return false;
+    }
+    if (now < _hold_off_until) return true;
+    if (_hold_since == Clock::time_point{}) {
+      _hold_since = now;
+      return false;
+    }
+    if (now - _hold_since >= kMaxGateHold) {
+      _hold_since = {};
+      _hold_off_until = now + kGateHoldOff;
+      return true;
+    }
+    return false;
   }
 
   bool send_client_frame(const ClientMsg &m) {
@@ -838,9 +1159,18 @@ private:
         _rewritten.assign(f, f + len);
         if (awdl_plan::rewrite_frame(_rewritten.data(), len, _away, _sta_dev->channel()))
           return send_frame(_rewritten.data(), len, false);
+      } else if (_follow_ch != 0) {
+        _rewritten.assign(f, f + len);
+        if (awdl_plan::rewrite_frame(_rewritten.data(), len, _follow_away, _follow_ch))
+          return send_frame(_rewritten.data(), len, false);
       }
     }
     return send_frame(f, len, false);
+  }
+
+  static bool is_pure_tcp_ack(const uint8_t *f, size_t len) {
+    AwDlTcp tcp;
+    return awdl::parse_awdl_tcp(f, len, tcp) && tcp.payload_bytes == 0 && (tcp.flags & 0x17u) == 0x10u;
   }
 
   /* Returns false only when the card has no room: the caller retries. */
@@ -850,17 +1180,46 @@ private:
     const bool unicast_data = is_data(fc) && !group;
     if (unicast_data && !ours) _last_awdl_data_us = now_us();
     if (unicast_data && !ours && len >= 24) {
-      Peer *p = station(f + 4);
-      if (p && p->sta_ok) return send_to_station(*p, f, len);
+      Peer *p = (!_dev.is_mt7925() || len >= 800) ? station(f + 4) : find_peer(f + 4);
+      if (p) {
+        p->last_active_us = now_us();
+        if (len >= 800 || p->rx_bulk > 0) _last_active_peer = p->addr;
+      }
+      if (p && p->sta_ok) {
+        if (len >= 800) p->bulk_frames++;
+        if (!_dev.is_mt7925() || len >= 800) {
+          return send_to_station(*p, f, len, false);
+        }
+        if ((p->rx_bulk >= 2 || p->bulk_frames >= 2) && is_pure_tcp_ack(f, len)) {
+          return send_to_station(*p, f, len, true);
+        }
+      }
     }
-    const uint16_t rate = unicast_data ? _ladder.levels[_ladder.level].second
-                                       : (channel > 14 ? Mt7902::tx_rate_ofdm(6) : Mt7902::tx_rate_ofdm(6));
-    /* On 2.4 GHz the MT7902 never completes a frame that waits for an
-     * acknowledgement (it stays queued and blocks the queue; 5 GHz is fine,
-     * measured with --test-kinds): send there without one. The service moves
-     * AWDL to the peer's 5 GHz channel as soon as it hears it. */
+    const bool mt7925_unicast = _dev.is_mt7925() && unicast_data;
+    bool closing_tcp = false;
+    if (mt7925_unicast && !ours && len >= 24) {
+      AwDlTcp tx_tcp;
+      if (awdl::parse_awdl_tcp(f, len, tx_tcp)) {
+        closing_tcp = (tx_tcp.flags & 0x05u) != 0;
+        _tcp_acks.note_local_tx(tx_tcp);
+        if (tx_tcp.payload_bytes > 0) {
+          const uint32_t key = awdl::TcpAckTracker::flow_key(tx_tcp.source, tx_tcp.destination);
+          _zombie_purged += std::erase_if(_window_retry_queue, [&](const RetryFrame &r) {
+            AwDlTcp old_tcp;
+            return awdl::parse_awdl_tcp(r.bytes.data(), r.bytes.size(), old_tcp) &&
+                   old_tcp.payload_bytes > 0 &&
+                   awdl::TcpAckTracker::flow_key(old_tcp.source, old_tcp.destination) == key &&
+                   old_tcp.sequence == tx_tcp.sequence;
+          });
+        }
+      }
+    }
+    const bool small_ctrl_pkt = _dev.is_mt7925() && len < 800;
+    const uint16_t rate = (unicast_data && !small_ctrl_pkt)
+                              ? _ladder.levels[_ladder.level].second
+                              : Mt7902::tx_rate_ofdm(6);
     _dev.force_no_ack = channel <= 14 ? 1 : -1;
-    const int token = _dev.transmit(f, len, rate);
+    const int token = _dev.transmit(f, len, rate, 0, mt7925_unicast ? kMt7925TxAttempts : 15u);
     if (token < 0) {
       if (_dev.tx_slots_free() == 0) return false;
       _tx_refused++;
@@ -868,28 +1227,172 @@ private:
     }
     _tx++;
     _inflight[static_cast<unsigned>(token)] = unicast_data;
+    if (unicast_data && !small_ctrl_pkt) _ladder_tokens.insert(static_cast<unsigned>(token));
+    if (mt7925_unicast) ++_mt7925_unicast_inflight;
+    if (mt7925_unicast && !ours && len >= 24 &&
+        std::memcmp(f + 16, kAwdlBssid, 6) == 0) {
+      Mac dst{};
+      std::memcpy(dst.data(), f + 4, 6);
+      awdl::PeerTxWindow sched{};
+      if (const auto w = _peer_windows.find(dst); w != _peer_windows.end()) sched = w->second;
+      sched.inherit_sync(_master_sync);
+      const bool unestablished_probe = find_peer_const(dst.data()) == nullptr;
+      const auto life = (closing_tcp || unestablished_probe) ? std::chrono::milliseconds(180) : kPeerRetryLifetime;
+      const unsigned tries = (closing_tcp || unestablished_probe) ? 4u : kPeerRetryAttempts;
+      _retry_candidates.emplace(static_cast<unsigned>(token),
+          RetryFrame{{f, f + len}, Clock::now() + life, {}, {}, sched, tries});
+    }
+    trace_tx(static_cast<unsigned>(token), f, len, unicast_data);
     (void)ours;
     return true;
   }
 
-  void on_tx_status(unsigned token, bool acked, unsigned) {
+  void on_tx_status(unsigned token, bool acked, unsigned tries) {
     if (_sta_dev && _sta_dev->on_tx_status(token, acked)) return;
     auto it = _inflight.find(token);
     const bool unicast_data = it != _inflight.end() && it->second;
     if (it != _inflight.end()) _inflight.erase(it);
+    _inflight_wcid.erase(token);
+    if (_dev.is_mt7925() && unicast_data && _mt7925_unicast_inflight > 0) --_mt7925_unicast_inflight;
     acked ? _tx_acked++ : _tx_failed++;
-    if (unicast_data) _ladder.result(acked);
+    if (_trace_tokens.erase(token))
+      say("awdl-tcp TX complete token=%u acked=%u tries=%u", token, acked ? 1u : 0u, tries);
+    const bool was_retry = _retry_tokens.erase(token) > 0;
+    if (was_retry && acked) ++_window_retry_acked;
+    if (auto candidate = _retry_candidates.extract(token); candidate && !acked &&
+        candidate.mapped().attempts_left &&
+        Clock::now() < candidate.mapped().expires && _window_retry_queue.size() < kMaxWindowRetryQueue) {
+      if (_tcp_acks.is_outbound_acked(candidate.mapped().bytes.data(), candidate.mapped().bytes.size()))
+        ++_zombie_purged;
+      else if (was_retry)
+        _window_retry_queue.push_front(std::move(candidate.mapped()));
+      else
+        _window_retry_queue.push_back(std::move(candidate.mapped()));
+    }
+    const bool ladder_sample = _ladder_tokens.erase(token) > 0;
+    if (unicast_data) {
+      acked ? _unicast_acked++ : _unicast_failed++;
+      if (!_dev.is_mt7925() || ladder_sample) _ladder.result(acked);
+    }
+  }
+
+  void trace_tx(unsigned token, const uint8_t *frame, size_t size, bool unicast) {
+    if (!_trace_tcp || !unicast || _trace_count >= 4096) return;
+    if (const auto tcp = awdl_tcp(frame, size)) {
+      _trace_tokens.insert(token);
+      trace_tcp_packet("TX", token, *tcp);
+    }
+  }
+
+  struct RetryFrame {
+    std::vector<uint8_t> bytes;
+    Clock::time_point expires, awake_until, retry_after;
+    awdl::PeerTxWindow schedule;
+    unsigned attempts_left;
+    uint8_t sta_wcid = 0;
+  };
+
+  void clear_retry_frames() {
+    _retry_candidates.clear();
+    _retry_tokens.clear();
+    _window_retry_queue.clear();
+    _peer_windows.clear();
+    _last_active_peer = {};
+    _master_sync = {};
+    _hold_since = {};
+    _hold_off_until = {};
+    _tcp_acks.clear();
+  }
+
+  void purge_acked_retries() {
+    _zombie_purged += std::erase_if(_window_retry_queue, [this](const RetryFrame &r) {
+      return _tcp_acks.is_outbound_acked(r.bytes.data(), r.bytes.size());
+    });
+    for (auto it = _retry_candidates.begin(); it != _retry_candidates.end();) {
+      if (_tcp_acks.is_outbound_acked(it->second.bytes.data(), it->second.bytes.size())) {
+        it = _retry_candidates.erase(it);
+        ++_zombie_purged;
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  unsigned retry_awake_frames() {
+    if (_window_retry_queue.empty()) return 0;
+    const auto now = Clock::now();
+    _retry_expired += std::erase_if(_window_retry_queue, [now](const RetryFrame &r) { return now >= r.expires; });
+    _zombie_purged += std::erase_if(_window_retry_queue, [this](const RetryFrame &r) {
+      return _tcp_acks.is_outbound_acked(r.bytes.data(), r.bytes.size());
+    });
+    if (_window_retry_queue.empty() || !_pipe.connected() ||
+        _retry_tokens.size() >= kMt7925MaxRetryInflight || !data_slot_available())
+      return 0;
+    const auto ready = std::find_if(_window_retry_queue.begin(), _window_retry_queue.end(),
+                                    [this, now](const RetryFrame &r) {
+                                      if (r.retry_after > now) return false;
+                                      if (now < r.awake_until) return true;
+                                      awdl::PeerTxWindow w = r.schedule;
+                                      if (w.sampled == Clock::time_point{}) w.inherit_sync(_master_sync);
+                                      const uint8_t cur_ch = _dev.channel();
+                                      if (w.valid(now) && w.has_channel(cur_ch))
+                                        return w.can_send(now, cur_ch, false);
+                                      return _follow_ch == 0;
+                                    });
+    if (ready == _window_retry_queue.end()) return 0;
+    auto &frame = ready->bytes;
+    frame[1] |= 0x08;
+    const unsigned tried = kPeerRetryAttempts > ready->attempts_left
+                               ? (kPeerRetryAttempts - ready->attempts_left)
+                               : 0u;
+    int id = -1;
+    if (ready->sta_wcid != 0 && tried < 8 && (fc_of(frame.data()) & 0x80u)) {
+      id = _dev.transmit_sta(frame.data(), frame.size(), ready->sta_wcid, 0, false, 6u);
+    } else {
+      const uint16_t retry_rate = (frame.size() < 800 || tried >= 10)
+                                      ? Mt7902::tx_rate_ofdm(6)
+                                      : (tried < 2 ? Mt7902::tx_rate_ht(2)
+                                                   : (tried < 5 ? Mt7902::tx_rate_ofdm(24)
+                                                                : Mt7902::tx_rate_ofdm(12)));
+      id = _dev.transmit(frame.data(), frame.size(), retry_rate, 0, kMt7925RetryTxAttempts);
+    }
+    if (id < 0) return 0;
+    const auto token = static_cast<unsigned>(id);
+    _inflight[token] = true;
+    ++_mt7925_unicast_inflight;
+    trace_tx(token, frame.data(), frame.size(), true);
+    _retry_tokens.insert(token);
+    --ready->attempts_left;
+    awdl::PeerTxWindow check = ready->schedule;
+    check.inherit_sync(_master_sync);
+    const auto spacing = (check.valid(now) && check.has_channel(channel))
+                             ? kPeerRetrySpacing
+                             : std::chrono::milliseconds(15);
+    ready->retry_after = now + spacing;
+    ready->awake_until = {};
+    if (ready->attempts_left) _retry_candidates.emplace(token, std::move(*ready));
+    _window_retry_queue.erase(ready);
+    ++_tx;
+    ++_window_retries;
+    return 1;
+  }
+
+  void trace_tcp_packet(const char *direction, unsigned token, const AwDlTcp &tcp) {
+    ++_trace_count;
+    say("awdl-tcp %s token=%u ports=%u>%u flags=%02x seq=%u ack=%u bytes=%u",
+        direction, token, tcp.source, tcp.destination, tcp.flags, tcp.sequence,
+        tcp.acknowledgment, tcp.payload_bytes);
   }
 
   void on_rx(const Mt7902::RxFrame &f) {
     _rx++;
     if (f.len < 10) return;
+    if (_own_set && f.len >= 16 && std::memcmp(f.data + 10, _own.data(), 6) == 0) return;
     const uint16_t fc = fc_of(f.data);
+    const auto now = Clock::now();
     note_bss(f);
     if (station_on_air() && f.len >= 20) {
       const RxFrame r{f.data, f.len, f.dbm, f.channel, 0, 0, false};
-      /* Block Ack requests from the AP, for the reorder buffers (WifiStation
-       * leaves control frames to the card). */
       const bool bar = (f.data[0] & 0xfc) == 0x84 && std::memcmp(f.data + 10, _sta_dev->ap(), 6) == 0;
       if (bar || _sta->owns(r)) {
         _sta_dev->receive(f);
@@ -900,9 +1403,6 @@ private:
     }
     if (is_awdl(f.data, f.len)) {
       _rx_awdl++;
-      /* NekoDropService moves the radio to the peer's 5 GHz channel, and
-       * learns its country, from these (Supervisor.OnEvent), as with the
-       * Intel radio. */
       if (!_peer_heard_here && f.channel == channel && channel > 14) {
         _peer_heard_here = true;
         say("AWDL peer heard on channel %u: transmitting allowed here", channel);
@@ -918,27 +1418,144 @@ private:
       }
       char c[3];
       if (awdl::peer_country(f.data, f.len, c) && _peer_country.note(c)) say("event: peer-country %s", _peer_country.confirmed);
+      if (_dev.is_mt7925() && f.len >= 24 && f.channel == _dev.channel()) {
+        _master_sync.parse_tlv4(f.data, f.len, now);
+        Mac src{};
+        std::memcpy(src.data(), f.data + 10, 6);
+        auto &sched = _peer_windows[src];
+        sched.note_frame(f.data, f.len, now);
+        if (sched.sampled == Clock::time_point{}) sched.inherit_sync(_master_sync);
+        if (sched.valid(now)) {
+          for (auto &retry : _window_retry_queue)
+            if (std::memcmp(retry.bytes.data() + 4, src.data(), 6) == 0) retry.schedule = sched;
+          for (auto &candidate : _retry_candidates)
+            if (std::memcmp(candidate.second.bytes.data() + 4, src.data(), 6) == 0) candidate.second.schedule = sched;
+        }
+      }
     }
     const bool to_us = _own_set && std::memcmp(f.data + 4, _own.data(), 6) == 0;
+    if (_dev.is_mt7925() && to_us && is_data(fc) && f.len >= 24 && f.channel == _dev.channel() &&
+        std::memcmp(f.data + 16, kAwdlBssid, 6) == 0) {
+      const bool pm = (f.data[1] & 0x10) != 0;
+      Mac src{};
+      std::memcpy(src.data(), f.data + 10, 6);
+      _peer_windows[src].note_data_rx(now, pm);
+      for (auto &retry : _window_retry_queue) {
+        if (std::memcmp(retry.bytes.data() + 4, f.data + 10, 6) == 0) {
+          retry.schedule.note_data_rx(now, pm);
+          if (!pm) retry.awake_until = now + std::chrono::milliseconds(4);
+        }
+      }
+      for (auto &candidate : _retry_candidates) {
+        if (std::memcmp(candidate.second.bytes.data() + 4, f.data + 10, 6) == 0) {
+          candidate.second.schedule.note_data_rx(now, pm);
+          if (!pm) candidate.second.awake_until = now + std::chrono::milliseconds(4);
+        }
+      }
+    }
     if (to_us && is_data(fc)) {
+      const uint64_t rx_now = now_us();
+      if (std::memcmp(f.data + 16, kAwdlBssid, 6) == 0) {
+        std::memcpy(_last_active_peer.data(), f.data + 10, 6);
+        if (Peer *p = find_peer(f.data + 10)) p->last_active_us = rx_now;
+      }
+      if (_dev.is_mt7925() && f.len >= 600 && std::memcmp(f.data + 16, kAwdlBssid, 6) == 0) {
+        if (Peer *p = station(f.data + 10)) {
+          p->rx_bulk++;
+          p->last_active_us = rx_now;
+        }
+      }
+      if (_dev.is_mt7925() && _tcp_acks.note_peer_rx(f.data, f.len)) purge_acked_retries();
+      if (_trace_tcp && _trace_count < 4096)
+        if (const auto tcp = awdl_tcp(f.data, f.len)) trace_tcp_packet("RX", 0, *tcp);
       _rx_to_us++;
-      _last_awdl_data_us = now_us();
+      _last_awdl_data_us = rx_now;
       if (f.data[1] & 0x08) _rx_to_us_retry++;
       if (f.data[1] & 0x10) _rx_to_us_pm++; /* the peer says it is going to sleep */
     }
-    if (to_us && is_action(fc) && f.len >= 24 + 4 && f.data[24] == 3) block_ack_action(f);
+    if (to_us && is_action(fc) && f.len >= 24 + 4 && f.data[24] == 3) {
+      block_ack_action(f);
+      return;
+    }
     if (is_awdl(f.data, f.len)) learn_caps(f);
+    if (to_us && _rx_ba_sessions > 0 && f.len >= 20 && (f.data[0] & 0xfcu) == 0x84u) {
+      _rx_reorder.on_bar(f.data, f.len, now_us(), [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+        queue_rx_to_client(d, l, dbm);
+      });
+      return;
+    }
     if (f.len < 24 || !_pipe.connected()) return;
     if (_bssid_set && std::memcmp(f.data + 16, _bssid.data(), 6) != 0) return;
+    if (to_us && _rx_ba_sessions > 0 &&
+        _rx_reorder.process(f.data, f.len, f.channel, f.dbm, now_us(),
+                            [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+                              queue_rx_to_client(d, l, dbm);
+                            })) {
+      return;
+    }
+    queue_rx_to_client(f.data, f.len, f.dbm);
+  }
+
+  void queue_one_rx_mpdu(const uint8_t *data, size_t len, int8_t dbm) {
     /* Radiotap: FLAGS and DBM_ANTSIGNAL only, as winawdl's radio. */
     _msg.assign(10, 0);
     _msg[2] = 10;
     const uint32_t present = (1u << 1) | (1u << 5);
     std::memcpy(&_msg[4], &present, 4);
-    _msg[9] = static_cast<uint8_t>(f.dbm);
-    _msg.insert(_msg.end(), f.data, f.data + f.len);
+    _msg[9] = static_cast<uint8_t>(dbm);
+    _msg.insert(_msg.end(), data, data + len);
     if (_msg.size() <= RADIO_LINK_MAX_PAYLOAD)
       _pipe.queue_send(RADIO_LINK_RX, {_msg.data(), _msg.size()});
+  }
+
+  void queue_rx_to_client(const uint8_t *data, size_t len, int8_t dbm) {
+    if (len < 24 || !_pipe.connected()) return;
+    if (_bssid_set && std::memcmp(data + 16, _bssid.data(), 6) != 0) return;
+    /* Split QoS Data A-MSDUs (QoS Control bit 7 = 0x80) into standard MPDUs for awdld. */
+    if (len >= 26 && (data[0] & 0x8cu) == 0x88u) {
+      const uint16_t fc = fc_of(data);
+      const size_t qos_off = ((fc & 0x0300u) == 0x0300u) ? 30u : 24u;
+      const size_t hdr_len = qos_off + 2u + ((fc & 0x8000u) ? 4u : 0u);
+      if (len > hdr_len + 14u && (data[qos_off] & 0x80u) != 0) {
+        size_t off = hdr_len;
+        unsigned emitted = 0;
+        while (off + 14u <= len) {
+          const size_t sub_len = (static_cast<size_t>(data[off + 12]) << 8) | data[off + 13];
+          if (sub_len == 0 || off + 14u + sub_len > len) break;
+          const uint8_t *sub_ptr = data + off + 14u;
+          size_t clean_len = sub_len;
+          size_t skip = 0, inner_len = 0;
+          if (awdl::unwrap_rfc1042_awdl(sub_ptr, sub_len, skip, inner_len)) {
+            sub_ptr += skip;
+            clean_len = inner_len;
+          }
+          _amsdu_mpdu.resize(hdr_len + clean_len);
+          std::memcpy(_amsdu_mpdu.data(), data, hdr_len);
+          _amsdu_mpdu[qos_off] &= static_cast<uint8_t>(~0x80u);
+          std::memcpy(_amsdu_mpdu.data() + hdr_len, sub_ptr, clean_len);
+          if (_dev.is_mt7925() && _tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
+            purge_acked_retries();
+          queue_one_rx_mpdu(_amsdu_mpdu.data(), _amsdu_mpdu.size(), dbm);
+          emitted++;
+          const size_t step = (14u + sub_len + 3u) & ~size_t(3u);
+          if (off + step > len) break;
+          off += step;
+        }
+        if (emitted > 0) return;
+      } else if (len > hdr_len + 16u) {
+        size_t skip = 0, inner_len = 0;
+        if (awdl::unwrap_rfc1042_awdl(data + hdr_len, len - hdr_len, skip, inner_len)) {
+          _amsdu_mpdu.resize(hdr_len + inner_len);
+          std::memcpy(_amsdu_mpdu.data(), data, hdr_len);
+          std::memcpy(_amsdu_mpdu.data() + hdr_len, data + hdr_len + skip, inner_len);
+          if (_dev.is_mt7925() && _tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
+            purge_acked_retries();
+          queue_one_rx_mpdu(_amsdu_mpdu.data(), _amsdu_mpdu.size(), dbm);
+          return;
+        }
+      }
+    }
+    queue_one_rx_mpdu(data, len, dbm);
   }
 
   /* ---- Peer stations and Block Ack (A-MPDU) ----
@@ -953,9 +1570,11 @@ private:
     Mac addr{};
     uint8_t wcid = 0;
     bool sta_ok = false;
+    bool ba_fallback = false;
     Mt7902::PeerCaps caps;
     uint16_t seq = 0; /* TID 0 sequence number, last used */
-    uint64_t data = 0;
+    uint64_t data = 0, bulk_frames = 0, rx_bulk = 0;
+    uint64_t last_tx_ba_us = 0, tx_ba_agreed_us = 0, last_active_us = 0;
     bool tx_ba = false, addba_pending = false;
     unsigned addba_tries = 0;
     uint16_t addba_ssn = 0;
@@ -969,14 +1588,29 @@ private:
     return nullptr;
   }
 
+  const Peer *find_peer_const(const uint8_t *mac) const {
+    for (const Peer &p : _peers)
+      if (std::memcmp(p.addr.data(), mac, 6) == 0) return &p;
+    return nullptr;
+  }
+
   /* The peer's station, set up on first use; nullptr where not possible. */
   Peer *station(const uint8_t *mac) {
     if (!aggregate || channel <= 14) return nullptr;
     if (Peer *p = find_peer(mac)) return p;
-    if (_peers.size() >= Mt7902::kLastPeerWcid - Mt7902::kFirstPeerWcid + 1u) return nullptr;
+    uint8_t free_wcid = 0;
+    for (uint8_t w = Mt7902::kFirstPeerWcid; w <= Mt7902::kLastPeerWcid; ++w) {
+      const bool taken = std::any_of(_peers.begin(), _peers.end(), [w](const Peer &e) { return e.wcid == w; });
+      if (!taken) {
+        free_wcid = w;
+        break;
+      }
+    }
+    if (!free_wcid) return nullptr;
     Peer p;
     std::memcpy(p.addr.data(), mac, 6);
-    p.wcid = static_cast<uint8_t>(Mt7902::kFirstPeerWcid + _peers.size());
+    p.wcid = free_wcid;
+    p.last_active_us = now_us();
     auto caps = _caps.find(mac_str(mac));
     if (caps != _caps.end()) p.caps = caps->second;
     p.sta_ok = _dev.sta_add(p.wcid, mac, p.caps);
@@ -998,6 +1632,11 @@ private:
         c.ht_cap = static_cast<uint16_t>(f.data[i + 5] | f.data[i + 6] << 8);
         c.ampdu_params = f.data[i + 7];
         c.rx_mcs[0] = f.data[i + 8];
+        if (value >= 7 && f.data[i + 9] == 0) {
+          c.rx_mcs[1] = 0;
+          c.vht_mcs = 0xfffe;
+          c.nss = 1;
+        }
         _caps[mac_str(f.data + 10)] = c;
         return;
       }
@@ -1005,7 +1644,7 @@ private:
     }
   }
 
-  bool send_to_station(Peer &p, const uint8_t *f, size_t len) {
+  bool send_to_station(Peer &p, const uint8_t *f, size_t len, bool pure_ack = false) {
     const uint16_t fc = fc_of(f);
     const size_t hdr = 24;
     if ((fc & 0x0300) || len > 3800) return send_frame(f, len, true); /* 4-address or oversized */
@@ -1023,26 +1662,101 @@ private:
     const uint16_t seq = static_cast<uint16_t>((p.seq + 1) & 0xfff);
     _qos[22] = static_cast<uint8_t>(seq << 4);
     _qos[23] = static_cast<uint8_t>(seq >> 4);
-    const int token = _dev.transmit_sta(_qos.data(), _qos.size(), p.wcid);
+    bool closing_tcp = false;
+    if (_dev.is_mt7925() && !pure_ack) {
+      AwDlTcp tx_tcp;
+      if (awdl::parse_awdl_tcp(_qos.data(), _qos.size(), tx_tcp)) {
+        closing_tcp = (tx_tcp.flags & 0x05u) != 0;
+        _tcp_acks.note_local_tx(tx_tcp);
+        if (tx_tcp.payload_bytes > 0) {
+          const uint32_t key = awdl::TcpAckTracker::flow_key(tx_tcp.source, tx_tcp.destination);
+          _zombie_purged += std::erase_if(_window_retry_queue, [&](const RetryFrame &r) {
+            AwDlTcp old_tcp;
+            return awdl::parse_awdl_tcp(r.bytes.data(), r.bytes.size(), old_tcp) &&
+                   old_tcp.payload_bytes > 0 &&
+                   awdl::TcpAckTracker::flow_key(old_tcp.source, old_tcp.destination) == key &&
+                   old_tcp.sequence == tx_tcp.sequence;
+          });
+        }
+      }
+    }
+    const unsigned attempts = _dev.is_mt7925() ? (pure_ack ? 6u : kMt7925StaTxAttempts) : 15u;
+    const int token = _dev.transmit_sta(_qos.data(), _qos.size(), p.wcid, 0, !pure_ack && p.tx_ba, attempts);
     if (token < 0) {
       if (_dev.tx_slots_free() == 0) return false;
       _tx_refused++;
       return true;
     }
     p.seq = seq;
-    p.data++;
+    const uint64_t t_now = now_us();
+    p.last_active_us = t_now;
+    if (!pure_ack) {
+      p.data++;
+      if (p.tx_ba) p.last_tx_ba_us = t_now;
+    }
     _tx++;
     _tx_sta++;
-    _inflight[static_cast<unsigned>(token)] = false;
-    maybe_ask_aggregation(p);
+    const auto tok = static_cast<unsigned>(token);
+    if (_dev.is_mt7925()) {
+      _inflight[tok] = true;
+      _inflight_wcid[tok] = p.wcid;
+      ++_mt7925_unicast_inflight;
+      if (!pure_ack && std::memcmp(f + 16, kAwdlBssid, 6) == 0) {
+        awdl::PeerTxWindow sched{};
+        if (const auto w = _peer_windows.find(p.addr); w != _peer_windows.end()) sched = w->second;
+        sched.inherit_sync(_master_sync);
+        const auto life = closing_tcp ? std::chrono::milliseconds(180) : kPeerRetryLifetime;
+        const unsigned tries = closing_tcp ? 4u : kPeerRetryAttempts;
+        _retry_candidates.emplace(
+            tok, RetryFrame{_qos, Clock::now() + life, {}, {}, sched, tries, p.wcid});
+      }
+      trace_tx(tok, _qos.data(), _qos.size(), true);
+    } else {
+      _inflight[tok] = false;
+    }
+    if (!pure_ack) maybe_ask_aggregation(p);
     return true;
   }
 
-  /* We ask the peer to take A-MPDUs on TID 0 once data flows. */
+  /* We ask the peer to take A-MPDUs on TID 0 once bulk data flows (skipping tiny /Discover TLS handshakes). */
   void maybe_ask_aggregation(Peer &p) {
-    if (p.tx_ba || p.data < 8 || p.addba_tries >= 5) return;
+    if (!_dev.is_mt7925()) {
+      if (p.tx_ba || p.data < 8 || p.addba_tries >= 5) return;
+      const auto now = Clock::now();
+      if (p.addba_pending && now - p.addba_at < std::chrono::seconds(2)) return;
+      p.addba_pending = true;
+      p.addba_tries++;
+      p.addba_at = now;
+      p.dialog = static_cast<uint8_t>(p.dialog == 255 ? 1 : p.dialog + 1);
+      p.addba_ssn = static_cast<uint16_t>((p.seq + 1) & 0xfff);
+      uint8_t r[24 + 9] = {};
+      mgmt_header(r, p.addr.data());
+      r[24] = 3;
+      r[25] = 0;
+      r[26] = p.dialog;
+      const uint16_t params = static_cast<uint16_t>(1u << 1 | 64u << 6);
+      r[27] = static_cast<uint8_t>(params);
+      r[28] = static_cast<uint8_t>(params >> 8);
+      r[31] = static_cast<uint8_t>(p.addba_ssn << 4);
+      r[32] = static_cast<uint8_t>(p.addba_ssn >> 4);
+      send_frame(r, sizeof(r), true);
+      return;
+    }
+    if (p.tx_ba || p.ba_fallback || p.bulk_frames < 8u || p.addba_tries >= 8)
+      return;
     const auto now = Clock::now();
-    if (p.addba_pending && now - p.addba_at < std::chrono::seconds(2)) return;
+    if (p.addba_pending && now - p.addba_at < std::chrono::milliseconds(200)) return;
+    if (_dev.is_mt7925()) {
+      const uint8_t cur_ch = _dev.channel();
+      const auto it = _peer_windows.find(p.addr);
+      if (it != _peer_windows.end()) {
+        awdl::PeerTxWindow w = it->second;
+        if (w.sampled == Clock::time_point{}) w.inherit_sync(_master_sync);
+        if (w.valid(now) && w.has_channel(cur_ch) &&
+            w.remaining_open(now, cur_ch, false) < std::chrono::milliseconds(4))
+          return;
+      }
+    }
     p.addba_pending = true;
     p.addba_tries++;
     p.addba_at = now;
@@ -1072,29 +1786,153 @@ private:
     r[23] = static_cast<uint8_t>(_seq >> 4);
   }
 
+  void end_peer_tx_ba(Peer &p, const char *why) {
+    if (!p.tx_ba) return;
+    _dev.sta_ba(p.wcid, p.addr.data(), 0, 0, 0, true, false);
+    uint8_t delba[awdl::kDelbaLength] = {};
+    const Mac bssid = _bssid_set ? _bssid : Mac{kAwdlBssid[0], kAwdlBssid[1], kAwdlBssid[2], kAwdlBssid[3], kAwdlBssid[4], kAwdlBssid[5]};
+    _seq = static_cast<uint16_t>((_seq + 1) & 0xfff);
+    awdl::build_delba(delba, p.addr.data(), _own.data(), bssid.data(), 0, true, _seq);
+    send_frame(delba, sizeof(delba), true);
+    p.tx_ba = false;
+    p.addba_pending = false;
+    p.addba_tries = 0;
+    p.ba_fallback = false;
+    p.bulk_frames = 0;
+    say("A-MPDU to %s ended (%s)", mac_str(p.addr.data()).c_str(), why);
+  }
+
+  void recover_stalled_peers() {
+    for (Peer &p : _peers) {
+      if (p.tx_ba) end_peer_tx_ba(p, "tx-stall");
+      if (p.sta_ok) {
+        _dev.sta_remove(p.wcid, p.addr.data());
+        p.sta_ok = false;
+      }
+    }
+    _dev.poll();
+    unsigned reclaimed = 0, requeued = 0;
+    const auto now = Clock::now();
+    for (auto it = _inflight_wcid.begin(); it != _inflight_wcid.end();) {
+      const unsigned tok = it->first;
+      it = _inflight_wcid.erase(it);
+      auto inf = _inflight.find(tok);
+      if (inf != _inflight.end()) {
+        if (inf->second && _mt7925_unicast_inflight > 0) --_mt7925_unicast_inflight;
+        _inflight.erase(inf);
+      }
+      _ladder_tokens.erase(tok);
+      _retry_tokens.erase(tok);
+      _trace_tokens.erase(tok);
+      _dev.reclaim_token(static_cast<uint16_t>(tok));
+      ++reclaimed;
+      if (auto cand = _retry_candidates.extract(tok)) {
+        if (cand.mapped().attempts_left && now < cand.mapped().expires &&
+            !_tcp_acks.is_outbound_acked(cand.mapped().bytes.data(), cand.mapped().bytes.size()) &&
+            _window_retry_queue.size() < kMaxWindowRetryQueue) {
+          _window_retry_queue.push_front(std::move(cand.mapped()));
+          ++requeued;
+        }
+      }
+    }
+    for (Peer &p : _peers) {
+      p.tx_ba = false;
+      p.addba_pending = false;
+      p.addba_tries = 0;
+      p.bulk_frames = 0;
+      p.sta_ok = _dev.sta_add(p.wcid, p.addr.data(), p.caps);
+    }
+    say("recovered stalled WCID TX queue: reclaimed %u tokens, requeued %u frames (inflight=%u, free=%u)",
+        reclaimed, requeued, _mt7925_unicast_inflight, _dev.tx_slots_free());
+  }
+
+  void maintain_peers(uint64_t t, bool queue_empty) {
+    if (!_dev.is_mt7925()) return;
+    {
+      const uint64_t done_now = _unicast_acked + _unicast_failed;
+      const bool blocked =
+          _mt7925_unicast_inflight > 0 && (!queue_empty || _mt7925_unicast_inflight >= 16u);
+      if (!blocked || done_now != _last_unicast_done) {
+        _last_unicast_done = done_now;
+        _unicast_stall_since_us = 0;
+        _unicast_ba_reset_done = false;
+      } else if (!_unicast_stall_since_us) {
+        _unicast_stall_since_us = t;
+      } else if (!_unicast_ba_reset_done && t - _unicast_stall_since_us >= 350000ull) {
+        _unicast_ba_reset_done = true;
+        say("TX BA queue stalled (%u inflight, %s); flushing WCID & reclaiming tokens",
+            _mt7925_unicast_inflight, _dev.tx_ring_state().c_str());
+        recover_stalled_peers();
+        _unicast_stall_since_us = 0;
+        _unicast_ba_reset_done = false;
+      } else if (t - _unicast_stall_since_us >= 2500000ull && !g_card_dead) {
+        say("TX unicast queue wedged (%u inflight for 2.5 s, %s); restarting radio",
+            _mt7925_unicast_inflight, _dev.tx_ring_state().c_str());
+        g_card_dead = true;
+        g_stop = true;
+        return;
+      }
+    }
+    for (Peer &p : _peers) {
+      if (p.tx_ba &&
+          awdl::ba_tx_session_idle(false, _window_retry_queue.size(), queue_empty ? 0u : 1u,
+                                   p.last_tx_ba_us, p.tx_ba_agreed_us, t)) {
+        end_peer_tx_ba(p, "idle");
+      }
+    }
+    if (_mt7925_unicast_inflight == 0 && queue_empty && _window_retry_queue.empty()) {
+      for (auto it = _peers.begin(); it != _peers.end();) {
+        if (!it->tx_ba && it->last_active_us && t - it->last_active_us >= 45000000ull) {
+          for (uint8_t tid = 0; tid < 8; ++tid) {
+            _rx_reorder.on_delba(it->addr.data(), tid, [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+              queue_rx_to_client(d, l, dbm);
+            });
+          }
+          if (it->sta_ok) _dev.sta_remove(it->wcid, it->addr.data());
+          if (_last_active_peer == it->addr) _last_active_peer = {};
+          say("station %s: wcid %u evicted after idle", mac_str(it->addr.data()).c_str(), it->wcid);
+          it = _peers.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
   void block_ack_action(const Mt7902::RxFrame &f) {
     const uint8_t action = f.data[25];
     const uint8_t *from = f.data + 10;
     if (action == 0 && f.len >= 24 + 9) { /* ADDBA request */
       Peer *p = station(from);
       if (!p || !p->sta_ok) return decline_addba(f);
+      const uint64_t t_now = now_us();
+      p->last_active_us = t_now;
+      if (p->tx_ba && t_now - p->last_tx_ba_us >= 1000000ull) {
+        end_peer_tx_ba(*p, "peer restarted session");
+      }
       const uint16_t params = static_cast<uint16_t>(f.data[27] | f.data[28] << 8);
       const uint8_t tid = static_cast<uint8_t>((params >> 2) & 0xf);
       uint16_t win = static_cast<uint16_t>(params >> 6);
       if (!win || win > 64) win = 64;
       const uint16_t ssn = static_cast<uint16_t>((f.data[31] | f.data[32] << 8) >> 4);
-      if (!_dev.sta_ba(p->wcid, from, tid, ssn, win, false, true)) return decline_addba(f);
+      const bool allow_amsdu = _dev.is_mt7925() && _dev.he80 && (params & 1u) != 0;
+      if (!_dev.sta_ba(p->wcid, from, tid, ssn, win, false, true, 0, allow_amsdu)) return decline_addba(f);
+      _rx_reorder.on_addba(from, tid, ssn, win, t_now, [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+        queue_rx_to_client(d, l, dbm);
+      });
       uint8_t r[24 + 9] = {};
       mgmt_header(r, from);
       r[24] = 3;
       r[25] = 1;          /* ADDBA response */
       r[26] = f.data[26]; /* dialog token */
-      const uint16_t out = static_cast<uint16_t>(1u << 1 | static_cast<unsigned>(tid) << 2 | win << 6);
+      const uint16_t out =
+          static_cast<uint16_t>((allow_amsdu ? 1u : 0u) | 1u << 1 | static_cast<unsigned>(tid) << 2 | win << 6);
       r[29] = static_cast<uint8_t>(out);
       r[30] = static_cast<uint8_t>(out >> 8);
       send_frame(r, sizeof(r), true);
       _rx_ba_sessions++;
-      say("A-MPDU from %s accepted: TID %u, window %u", mac_str(from).c_str(), tid, win);
+      say("A-MPDU from %s accepted: TID %u, window %u, amsdu %u", mac_str(from).c_str(), tid, win,
+          allow_amsdu ? 1u : 0u);
     } else if (action == 1 && f.len >= 24 + 9) { /* ADDBA response */
       Peer *p = find_peer(from);
       if (!p || !p->addba_pending || f.data[26] != p->dialog) return;
@@ -1105,9 +1943,11 @@ private:
       if (!win || win > 64) win = 64;
       if (status == 0 && _dev.sta_ba(p->wcid, from, 0, p->addba_ssn, win, true, true)) {
         p->tx_ba = true;
+        p->tx_ba_agreed_us = p->last_tx_ba_us = p->last_active_us = now_us();
         _tx_ba_sessions++;
         say("A-MPDU to %s agreed: window %u", mac_str(from).c_str(), win);
       } else {
+        if (_dev.is_mt7925()) p->ba_fallback = true;
         say("A-MPDU to %s refused (status %u)", mac_str(from).c_str(), status);
       }
     } else if (action == 2 && f.len >= 24 + 6) { /* DELBA */
@@ -1117,9 +1957,15 @@ private:
       const bool peer_was_originator = (params & 0x0800) != 0;
       const uint8_t tid = static_cast<uint8_t>(params >> 12);
       _dev.sta_ba(p->wcid, from, tid, 0, 0, !peer_was_originator, false);
+      if (peer_was_originator) {
+        _rx_reorder.on_delba(from, tid, [this](const uint8_t *d, size_t l, uint8_t, int8_t dbm) {
+          queue_rx_to_client(d, l, dbm);
+        });
+      }
       if (!peer_was_originator && tid == 0) {
         p->tx_ba = false;
         p->addba_tries = 0;
+        p->bulk_frames = 0;
       }
       say("A-MPDU with %s ended by the peer (TID %u)", mac_str(from).c_str(), tid);
     }
@@ -1153,6 +1999,7 @@ private:
   std::mutex _mutex;
   std::deque<ClientMsg> _queue;
   std::map<unsigned, bool> _inflight;
+  std::map<unsigned, uint8_t> _inflight_wcid;
   std::vector<uint8_t> _msg;
   Mac _own{}, _bssid{};
   bool _own_set = false, _bssid_set = false;
@@ -1166,6 +2013,7 @@ private:
   std::vector<Peer> _peers;
   std::map<std::string, Mt7902::PeerCaps> _caps;
   std::vector<uint8_t> _qos;
+  std::vector<uint8_t> _amsdu_mpdu;
   uint64_t _tx_sta = 0, _rx_ba_sessions = 0, _tx_ba_sessions = 0;
   Clock::time_point _stalled_since{};
   uint64_t _rx_to_us_pm = 0;
@@ -1179,6 +2027,9 @@ private:
   AwClock _aw;
   awdl_plan::InfraMeter _meter;
   uint8_t _away[16] = {};
+  uint8_t _follow_away[16] = {};
+  uint8_t _follow_ch = 0;
+  Clock::time_point _follow_drain_since{};
   bool _timeshare = false, _ps_asked = false;
   Clock::time_point _ps_at{}, _running_since{};
   uint64_t _last_awdl_data_us = 0;
@@ -1186,6 +2037,23 @@ private:
   uint64_t _moves = 0, _move_us = 0, _move_us_max = 0, _tx_stale = 0;
   unsigned _move_fail_logged = 0;
   bool _move_failed = false;
+
+  bool _client_reset = false;
+  bool _trace_tcp = false;
+  unsigned _mt7925_unicast_inflight = 0;
+  unsigned _trace_count = 0;
+  std::set<unsigned> _trace_tokens, _retry_tokens, _ladder_tokens;
+  std::map<unsigned, RetryFrame> _retry_candidates;
+  std::deque<RetryFrame> _window_retry_queue;
+  std::map<Mac, awdl::PeerTxWindow> _peer_windows;
+  Mac _last_active_peer{};
+  awdl::SyncAnchor _master_sync;
+  awdl::TcpAckTracker _tcp_acks;
+  mtk::RxBaReorder _rx_reorder;
+  Clock::time_point _hold_since{}, _hold_off_until{}, _last_busy_at{};
+  uint64_t _unicast_acked = 0, _unicast_failed = 0, _last_unicast_done = 0, _unicast_stall_since_us = 0;
+  bool _unicast_ba_reset_done = false;
+  uint64_t _window_retries = 0, _window_retry_acked = 0, _zombie_purged = 0, _retry_expired = 0, _window_holds = 0;
 };
 
 /* ---- Self tests on the air ---- */
@@ -1297,6 +2165,43 @@ int test_tx(Mt7902 &dev, unsigned seconds) {
   return acked ? 0 : 5;
 }
 
+/* A broadcast Wi-Fi probe request checks WFDMA and TX completions even on
+ * channels where no nearby AP sends beacons. */
+int test_broadcast(Mt7902 &dev, unsigned seconds) {
+  constexpr uint8_t broadcast[] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  uint8_t frame[34] = {0x40, 0};
+  std::memcpy(frame + 4, broadcast, 6);
+  std::memcpy(frame + 10, dev.mac_address(), 6);
+  std::memcpy(frame + 16, broadcast, 6);
+  constexpr uint8_t ies[] = {0, 0, 1, 6, 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48};
+  std::memcpy(frame + 24, ies, sizeof(ies));
+  unsigned sent = 0, completed = 0, success = 0, responses = 0;
+  dev.set_tx_status_handler([&](unsigned, bool ok, unsigned) {
+    ++completed;
+    if (ok) ++success;
+  });
+  dev.set_rx_handler([&](const Mt7902::RxFrame &f) {
+    if (f.len >= 24 && (fc_of(f.data) & 0xfc) == 0x50 &&
+        std::memcmp(f.data + 4, dev.mac_address(), 6) == 0) ++responses;
+  });
+  const auto end = Clock::now() + std::chrono::seconds(seconds);
+  auto next = Clock::now();
+  while (Clock::now() < end && !g_stop) {
+    if (Clock::now() >= next) {
+      const uint16_t seq = static_cast<uint16_t>((sent & 0xfff) << 4);
+      std::memcpy(frame + 22, &seq, sizeof(seq));
+      if (dev.transmit(frame, sizeof(frame), Mt7902::tx_rate_ofdm(6)) >= 0) ++sent;
+      next = Clock::now() + std::chrono::milliseconds(250);
+    }
+    if (!dev.poll()) Sleep(1);
+  }
+  const auto drain = Clock::now() + std::chrono::milliseconds(500);
+  while (Clock::now() < drain) if (!dev.poll()) Sleep(1);
+  say("test-broadcast: %u queued, %u TX completions (%u success), %u AP replies; %s",
+      sent, completed, success, responses, dev.tx_ring_state().c_str());
+  return success ? 0 : 5;
+}
+
 /* Which kinds of frame the card completes: group action frames (as awdld
  * sends AWDL), with and without NO_ACK, and unicast data on the AC and ALTX
  * queues, to an access point heard here. */
@@ -1311,55 +2216,109 @@ int test_kinds(Mt7902 &dev, unsigned per_kind, int only) {
       ap = m;
     }
   });
-  const auto listen_end = Clock::now() + std::chrono::seconds(3);
+  const auto listen_end = Clock::now() + std::chrono::milliseconds(1500);
   while (Clock::now() < listen_end && !g_stop)
     if (!dev.poll()) Sleep(1);
-  if (!ap) {
-    say("test-kinds: no access point heard");
-    return 4;
-  }
   dev.set_rx_handler(nullptr);
-  struct Kind { const char *name; bool group; bool data; int no_ack; int altx; uint64_t sent = 0, ok = 0, bad = 0; };
-  Kind kinds[] = {{"group action, NO_ACK", true, false, 1, 1},
-                  {"group action, no NO_ACK", true, false, 0, 1},
-                  {"unicast data, AC queue", false, true, 0, 0},
-                  {"unicast data, ALTX queue", false, true, 0, 1},
-                  {"unicast action, ALTX", false, false, 0, 1}};
-  std::map<unsigned, int> owner;
+  if (!ap) {
+    if (!dev.is_mt7925()) {
+      say("test-kinds: no access point heard");
+      return 4;
+    }
+    ap = Mac{0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
+    say("test-kinds: no AP heard on channel %u; using synthetic peer %s to measure queue latency",
+        dev.channel(), mac_str(ap->data()).c_str());
+  } else {
+    say("test-kinds: target AP %s (%d dBm)", mac_str(ap->data()).c_str(), best);
+  }
+  struct Kind {
+    const char *name;
+    bool group;
+    bool data;
+    int no_ack;
+    int altx;
+    uint16_t rate;
+    size_t payload;
+    uint64_t sent = 0, ok = 0, bad = 0, total_us = 0, max_us = 0;
+  };
+  Kind kinds[] = {
+      {"group action, NO_ACK", true, false, 1, 1, Mt7902::tx_rate_ofdm(6), 16},
+      {"group action, no NO_ACK", true, false, 0, 1, Mt7902::tx_rate_ofdm(6), 16},
+      {"unicast data, AC queue", false, true, 0, 0, Mt7902::tx_rate_ofdm(6), 16},
+      {"unicast data, ALTX OFDM6", false, true, 0, 1, Mt7902::tx_rate_ofdm(6), 16},
+      {"unicast data, ALTX OFDM24", false, true, 0, 1, Mt7902::tx_rate_ofdm(24), 1400},
+      {"unicast data, ALTX MCS4", false, true, 0, 1, Mt7902::tx_rate_ht(4), 1400},
+      {"unicast data, ALTX VHT1S4", false, true, 0, 1, Mt7902::tx_rate_vht(4, 1), 1400},
+      {"unicast data, ALTX VHT1S7", false, true, 0, 1, Mt7902::tx_rate_vht(7, 1), 1400},
+      {"unicast data, ALTX VHT2S7", false, true, 0, 1, Mt7902::tx_rate_vht(7, 2), 1400},
+      {"unicast action, ALTX", false, false, 0, 1, Mt7902::tx_rate_ofdm(6), 16},
+  };
+  struct PendingKind {
+    int kind;
+    Clock::time_point at;
+  };
+  std::map<unsigned, PendingKind> owner;
   dev.set_tx_status_handler([&](unsigned token, bool ok, unsigned) {
     auto it = owner.find(token);
     if (it == owner.end()) return;
-    ok ? kinds[it->second].ok++ : kinds[it->second].bad++;
+    Kind &K = kinds[it->second.kind];
+    const auto us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - it->second.at).count());
+    K.total_us += us;
+    if (us > K.max_us) K.max_us = us;
+    ok ? K.ok++ : K.bad++;
     owner.erase(it);
   });
   const uint8_t *me = dev.mac_address();
   uint16_t seq = 0;
-  for (int k = 0; k < 5; k++) {
+  constexpr int kNumKinds = static_cast<int>(sizeof(kinds) / sizeof(kinds[0]));
+  for (int k = 0; k < kNumKinds; k++) {
     if (only >= 0 && k != only) continue;
     Kind &K = kinds[k];
     dev.force_no_ack = K.no_ack;
     dev.force_altx = K.altx;
     for (unsigned i = 0; i < per_kind && !g_stop; i++) {
-      uint8_t f[24 + 8 + 16] = {};
+      std::vector<uint8_t> f(24 + 8 + K.payload, 0);
       f[0] = K.data ? 0x08 : 0xd0;
       if (K.data) f[1] = 0x01; /* to DS */
-      if (K.group) std::memcpy(f + 4, kAwdlBssid, 6), f[4] = 0x01; else std::memcpy(f + 4, ap->data(), 6);
-      std::memcpy(f + 10, me, 6);
-      std::memcpy(f + 16, ap->data(), 6);
+      if (K.group) {
+        std::memcpy(f.data() + 4, kAwdlBssid, 6);
+        f[4] = 0x01;
+      } else {
+        std::memcpy(f.data() + 4, ap->data(), 6);
+      }
+      std::memcpy(f.data() + 10, me, 6);
+      std::memcpy(f.data() + 16, ap->data(), 6);
       seq = static_cast<uint16_t>((seq + 1) & 0xfff);
       f[22] = static_cast<uint8_t>(seq << 4);
       f[23] = static_cast<uint8_t>(seq >> 4);
-      if (K.data) { const uint8_t llc[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e}; std::memcpy(f + 24, llc, 8); }
-      else { f[24] = 127; f[25] = 0x00; f[26] = 0x17; f[27] = 0xf2; f[28] = 0x08; }
-      const int t = dev.transmit(f, sizeof(f), Mt7902::tx_rate_ofdm(6));
-      if (t >= 0) { owner[static_cast<unsigned>(t)] = k; K.sent++; }
+      if (K.data) {
+        const uint8_t llc[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e};
+        std::memcpy(f.data() + 24, llc, 8);
+      } else {
+        f[24] = 127;
+        f[25] = 0x00;
+        f[26] = 0x17;
+        f[27] = 0xf2;
+        f[28] = 0x08;
+      }
+      const auto sent_at = Clock::now();
+      const int t = dev.transmit(f.data(), f.size(), K.rate, 0, dev.is_mt7925() ? 3u : 15u);
+      if (t >= 0) {
+        owner[static_cast<unsigned>(t)] = {k, sent_at};
+        K.sent++;
+      }
       const auto gap = Clock::now() + std::chrono::milliseconds(15);
-      while (Clock::now() < gap) if (!dev.poll()) Sleep(1);
+      while (Clock::now() < gap)
+        if (!dev.poll()) Sleep(0);
     }
-    const auto drain = Clock::now() + std::chrono::milliseconds(800);
-    while (Clock::now() < drain) if (!dev.poll()) Sleep(1);
-    say("test-kinds: %-26s sent %llu, completed ok %llu, failed %llu, never reported %llu", K.name, K.sent, K.ok,
-        K.bad, K.sent - K.ok - K.bad);
+    const auto drain = Clock::now() + std::chrono::milliseconds(2600);
+    while (Clock::now() < drain && (K.ok + K.bad) < K.sent)
+      if (!dev.poll()) Sleep(0);
+    const uint64_t done = K.ok + K.bad;
+    const uint64_t avg_us = done ? K.total_us / done : 0;
+    say("test-kinds: %-26s sent %llu, ok %llu, failed %llu, unreported %llu, avg %llu us, max %llu us",
+        K.name, K.sent, K.ok, K.bad, K.sent - done, avg_us, K.max_us);
   }
   dev.force_no_ack = dev.force_altx = -1;
   say("test-kinds: %s", dev.tx_ring_state().c_str());
@@ -1407,7 +2366,7 @@ int test_sta(Mt7902 &dev, unsigned frames) {
     f[23] = static_cast<uint8_t>(seq >> 4);
     const uint8_t llc[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e};
     std::memcpy(f + 26, llc, 8);
-    if (dev.transmit_sta(f, sizeof(f), 1) >= 0) sent++;
+    if (dev.transmit_sta(f, sizeof(f), 1, 0, false) >= 0) sent++;
     const auto gap = Clock::now() + std::chrono::milliseconds(10);
     while (Clock::now() < gap) if (!dev.poll()) Sleep(1);
   }
@@ -1415,8 +2374,40 @@ int test_sta(Mt7902 &dev, unsigned frames) {
   while (Clock::now() < drain) if (!dev.poll()) Sleep(1);
   say("test-sta: %llu QoS data frames at the firmware's rate, %llu acknowledged, %llu not, %llu unreported", sent, ok,
       bad, sent - ok - bad);
+  {
+    uint64_t b_sent = 0, b_ok = 0, b_bad = 0;
+    dev.set_tx_status_handler([&](unsigned, bool acked, unsigned) { acked ? b_ok++ : b_bad++; });
+    dev.set_tx_batch(true);
+    const auto b_t0 = Clock::now();
+    for (unsigned i = 0; i < 64 && !g_stop; i++) {
+      uint8_t f[26 + 8 + 1200] = {};
+      f[0] = 0x88;
+      f[1] = 0x01;
+      std::memcpy(f + 4, ap->data(), 6);
+      std::memcpy(f + 10, me, 6);
+      std::memcpy(f + 16, ap->data(), 6);
+      const uint16_t seq = static_cast<uint16_t>(frames + i + 1);
+      f[22] = static_cast<uint8_t>(seq << 4);
+      f[23] = static_cast<uint8_t>(seq >> 4);
+      const uint8_t llc[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e};
+      std::memcpy(f + 26, llc, 8);
+      if (dev.transmit_sta(f, sizeof(f), 1, 0, false, 8) >= 0) b_sent++;
+    }
+    dev.flush_tx();
+    const auto q_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - b_t0).count());
+    const auto b_deadline = Clock::now() + std::chrono::milliseconds(800);
+    while (b_ok + b_bad < b_sent && Clock::now() < b_deadline && !g_stop)
+      if (!dev.poll()) YieldProcessor();
+    const auto b_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - b_t0).count());
+    dev.set_tx_batch(false);
+    say("test-sta: %llu-frame batched AC00 burst queued in %llu us, completed in %llu us (%llu us/frame), %llu acknowledged, %llu not, %llu unreported",
+        b_sent, q_us, b_us, b_sent ? b_us / b_sent : 0ull, b_ok, b_bad, b_sent - b_ok - b_bad);
+    dev.set_tx_status_handler(nullptr);
+  }
   const bool rx_ba = dev.sta_ba(1, ap->data(), 0, 1, 64, false, true) && dev.sta_ba(1, ap->data(), 0, 0, 0, false, false);
-  const bool tx_ba = dev.sta_ba(1, ap->data(), 0, static_cast<uint16_t>(frames + 1), 64, true, true) && dev.sta_ba(1, ap->data(), 0, 0, 0, true, false);
+  const bool tx_ba = dev.sta_ba(1, ap->data(), 0, static_cast<uint16_t>(frames + 65), 64, true, true) && dev.sta_ba(1, ap->data(), 0, 0, 0, true, false);
   say("test-sta: Block Ack commands: receive %s, send %s", rx_ba ? "accepted" : "refused", tx_ba ? "accepted" : "refused");
   say("test-sta: station removed: %s", dev.sta_remove(1, ap->data()) ? "yes" : "no");
   return ok ? 0 : 7;
@@ -1425,24 +2416,45 @@ int test_sta(Mt7902 &dev, unsigned frames) {
 /* How long a channel move takes, between the given channel and the other
  * 5 GHz block (the station/AWDL time sharing pays it twice an entry). */
 int test_switch(Mt7902 &dev, unsigned moves) {
-  const uint8_t a = dev.channel(), b = a == 100 ? 44 : 100;
+  const uint8_t a = dev.channel();
+  const uint8_t b = dev.is_mt7925() ? (a == 48 ? 149 : 48) : (a == 100 ? 44 : 100);
   const uint8_t wa = dev.width_mhz();
   /* Frames heard after each move, and on which channel the card says. */
   uint64_t heard = 0, heard_there = 0;
   uint8_t target = 0;
+  std::optional<Mac> best_ap_a, best_ap_b;
+  int best_dbm_a = -128, best_dbm_b = -128;
   dev.set_rx_handler([&](const Mt7902::RxFrame &f) {
     heard++;
     heard_there += f.channel == target;
+    if (f.len >= 24 && is_beacon(fc_of(f.data)) && f.channel == target) {
+      if (target == a && f.dbm > best_dbm_a) {
+        best_dbm_a = f.dbm;
+        Mac m;
+        std::memcpy(m.data(), f.data + 16, 6);
+        best_ap_a = m;
+      } else if (target == b && f.dbm > best_dbm_b) {
+        best_dbm_b = f.dbm;
+        Mac m;
+        std::memcpy(m.data(), f.data + 16, 6);
+        best_ap_b = m;
+      }
+    }
   });
   struct Way {
     const char *name;
     bool sniffer, wait;
   };
-  const Way ways[] = {{"switch + sniffer, waiting", true, true},
-                      {"switch only, waiting", false, true},
-                      {"switch + sniffer, not waiting", true, false},
-                      {"switch only, not waiting", false, false}};
-  for (const Way &w : ways) {
+  const Way ways_all[] = {{"switch + sniffer, waiting", true, true},
+                          {"switch only, waiting", false, true},
+                          {"switch + sniffer, not waiting", true, false},
+                          {"switch only, not waiting", false, false}};
+  const Way ways_7925[] = {{"rlm + sniffer, waiting", true, true},
+                           {"rlm + sniffer, not waiting", true, false}};
+  const size_t nways = dev.is_mt7925() ? 2 : 4;
+  const Way *ways = dev.is_mt7925() ? ways_7925 : ways_all;
+  for (size_t wi = 0; wi < nways; ++wi) {
+    const Way &w = ways[wi];
     dev.move_sniffer = w.sniffer;
     dev.move_wait = w.wait;
     std::vector<uint64_t> total;
@@ -1461,13 +2473,64 @@ int test_switch(Mt7902 &dev, unsigned moves) {
     }
     std::sort(total.begin(), total.end());
     const size_t n = total.size();
-    say("test-switch: %-30s %zu moves %u<->%u: median %llu us, 90%% %llu us, longest %llu us (RF %llu, sniffer %llu, "
+    say("test-switch: %-30s %zu moves %u<->%u: median %llu us, 90%% %llu us, longest %llu us (RLM/RF %llu, sniffer %llu, "
         "timing %llu us average); %llu frames heard after the moves, %llu%% on the channel moved to; %llu failed",
         w.name, n, a, b, n ? total[n / 2] : 0ull, n ? total[n * 9 / 10] : 0ull, n ? total[n - 1] : 0ull,
         n ? steps[0] / n : 0ull, n ? steps[1] / n : 0ull, n ? steps[2] / n : 0ull, heard,
         heard ? heard_there * 100 / heard : 0ull, failed);
   }
   dev.move_sniffer = dev.move_wait = true;
+  dev.set_rx_handler(nullptr);
+  if (dev.is_mt7925() && (best_ap_a || best_ap_b)) {
+    const bool use_b = best_ap_b && (!best_ap_a || best_dbm_b > best_dbm_a);
+    const uint8_t ap_ch = use_b ? b : a;
+    const uint8_t alt_ch = use_b ? a : b;
+    const Mac ap = use_b ? *best_ap_b : *best_ap_a;
+    const int ap_dbm = use_b ? best_dbm_b : best_dbm_a;
+    dev.set_channel(ap_ch, wa);
+    Mt7902::PeerCaps caps;
+    if (dev.sta_add(1, ap.data(), caps)) {
+      auto send_batch = [&](unsigned count, uint16_t base_seq) -> uint64_t {
+        uint64_t ok = 0, done = 0;
+        dev.set_tx_status_handler([&](unsigned, bool acked, unsigned) {
+          if (acked) ok++;
+          done++;
+        });
+        dev.set_tx_batch(true);
+        for (unsigned i = 0; i < count; ++i) {
+          uint8_t f[26 + 8 + 1200] = {};
+          f[0] = 0x88;
+          f[1] = 0x01;
+          std::memcpy(f + 4, ap.data(), 6);
+          std::memcpy(f + 10, dev.mac_address(), 6);
+          std::memcpy(f + 16, ap.data(), 6);
+          const uint16_t seq = static_cast<uint16_t>(base_seq + i);
+          f[22] = static_cast<uint8_t>(seq << 4);
+          f[23] = static_cast<uint8_t>(seq >> 4);
+          const uint8_t llc[8] = {0xaa, 0xaa, 0x03, 0, 0, 0, 0x88, 0x8e};
+          std::memcpy(f + 26, llc, 8);
+          dev.transmit_sta(f, sizeof(f), 1, 0, false, 8);
+        }
+        dev.flush_tx();
+        const auto dl = Clock::now() + std::chrono::milliseconds(400);
+        while (done < count && Clock::now() < dl)
+          if (!dev.poll()) YieldProcessor();
+        dev.set_tx_batch(false);
+        dev.set_tx_status_handler(nullptr);
+        return ok;
+      };
+      const uint64_t ok_before = send_batch(8, 1);
+      for (int hop = 0; hop < 4; ++hop) {
+        dev.set_channel(hop % 2 == 0 ? alt_ch : ap_ch, wa);
+      }
+      dev.set_channel(ap_ch, wa);
+      const uint64_t ok_after = send_batch(16, 17);
+      say("test-switch: STA_REC across 4x %u<->%u hops on ch %u (%s, %d dBm): before %llu/8 acked, after %llu/16 acked",
+          ap_ch, alt_ch, ap_ch, mac_str(ap.data()).c_str(), ap_dbm, ok_before, ok_after);
+      dev.sta_remove(1, ap.data());
+    }
+  }
+  dev.set_channel(a, wa);
   return 0;
 }
 
@@ -1532,24 +2595,34 @@ int main(int argc, char **argv) {
   if (!opt) {
     std::fprintf(stderr,
                  "usage: %s <channel> [--width 20|40|80] [--country CC] [--fw-dir DIR] "
-                 "[--data-rate auto|MCSn|OFDMn] [--test-rx S] [--test-tx S]\n",
+                 "[--mt7925] [--data-rate auto|MCSn|OFDMn] [--test-rx S] [--test-tx S]\n",
                  argv[0]);
     return 2;
   }
   SetConsoleCtrlHandler(on_console, TRUE);
   timeBeginPeriod(1);
-  SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+  if (opt->mt7925) {
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    PROCESS_POWER_THROTTLING_STATE pts{};
+    pts.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    pts.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    pts.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &pts, sizeof(pts));
+  } else {
+    SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+  }
 
-  Mt7902 dev;
+  Mt7902 dev(opt->mt7925);
+  dev.he80 = opt->he80;
   dev.set_logger([](const std::string &l) { std::printf("radio: %s\n", l.c_str()); std::fflush(stdout); });
-  dev.set_event_handler([](const uint8_t *d, size_t len) {
+  dev.set_event_handler([mt7925 = opt->mt7925](const uint8_t *d, size_t len) {
     /* Unsolicited firmware events (and answers nobody waited for). */
-    if (len < sizeof(mt::McuRxd)) return;
-    const auto *r = reinterpret_cast<const mt::McuRxd *>(d);
-    /* MCU_EVENT_COREDUMP (0xf0): the firmware asserted. It no longer answers
-     * commands nor reports sent frames; only a fresh start brings it back. */
+    const size_t offset = mt7925 ? mt::mt7925::kRxHeaderExtra : 0;
+    const size_t header = sizeof(mt::McuRxd) + offset;
+    if (len < header) return;
+    const auto *r = reinterpret_cast<const mt::McuRxd *>(d + offset);
     if (r->eid == 0xf0 && !g_card_dead) {
-      const std::string text(reinterpret_cast<const char *>(d) + sizeof(mt::McuRxd), len - sizeof(mt::McuRxd));
+      const std::string text(reinterpret_cast<const char *>(d) + header, len - header);
       if (text.find("ASSERT") != std::string::npos) {
         say("firmware crashed (%.100s): restarting the radio", text.c_str());
         if (g_stations_up) {
@@ -1563,15 +2636,15 @@ int main(int argc, char **argv) {
     static unsigned shown = 0;
     if (shown++ < 60) {
       std::string text;
-      for (size_t i = sizeof(mt::McuRxd); i < len && text.size() < 160; i++)
+      for (size_t i = header; i < len && text.size() < 160; i++)
         text += (d[i] >= 32 && d[i] < 127) ? static_cast<char>(d[i]) : '.';
       say("fw-event: eid %02x ext %02x seq %u option %02x len %zu %s", r->eid, r->ext_eid, r->seq, r->option, len,
           text.c_str());
     }
   });
-  const std::string fw = opt->fw_dir.empty() ? find_firmware_dir() : opt->fw_dir;
+  const std::string fw = opt->fw_dir.empty() ? find_firmware_dir(opt->mt7925) : opt->fw_dir;
   std::string error;
-  if (fw.empty()) error = "no MT7902 firmware found (WIFI_RAM_CODE_MT7902_1.bin)";
+  if (fw.empty()) error = opt->mt7925 ? "no MT7925 firmware found" : "no MT7902 firmware found (WIFI_RAM_CODE_MT7902_1.bin)";
   else if (!dev.open(fw, error)) {}
   else if (!dev.radio_start(opt->channel, opt->width, opt->country, error)) {}
   if (!error.empty()) {
@@ -1579,11 +2652,12 @@ int main(int argc, char **argv) {
     dev.close();
     return 1;
   }
-  say("MT7902 firmware %s, MAC %s", dev.firmware_version().c_str(), mac_str(dev.mac_address()).c_str());
+  say("MT%04X firmware %s, MAC %s", dev.chip_id(), dev.firmware_version().c_str(), mac_str(dev.mac_address()).c_str());
 
   int rc = 0;
   if (opt->test_rx) rc = test_rx(dev, opt->test_rx);
   else if (opt->test_tx) rc = test_tx(dev, opt->test_tx);
+  else if (opt->test_broadcast) rc = test_broadcast(dev, opt->test_broadcast);
   else if (opt->test_kinds) rc = test_kinds(dev, opt->test_kinds, opt->only);
   else if (opt->test_sta) rc = test_sta(dev, opt->test_sta);
   else if (opt->test_switch) rc = test_switch(dev, opt->test_switch);
@@ -1595,7 +2669,7 @@ int main(int argc, char **argv) {
       dev.close();
       return 1;
     }
-    Relay relay(dev, pipe, make_ladder(opt->data_rate));
+    Relay relay(dev, pipe, make_ladder(opt->data_rate, opt->mt7925, dev.width_mhz()), opt->trace_tcp);
     relay.channel = opt->channel;
     relay.width = dev.width_mhz();
     relay.aggregate = opt->aggregate;
@@ -1605,9 +2679,10 @@ int main(int argc, char **argv) {
     }
     std::thread reader([&] {
       while (!g_stop && pipe.wait_for_client()) {
-        radio_link_hello hello{RADIO_LINK_VERSION, relay.channel, relay.width, {}};
+        const uint8_t shm_flag = opt->mt7925 ? pipe.shm_cap_flag() : 0;
+        radio_link_hello hello{RADIO_LINK_VERSION, relay.channel, relay.width, {shm_flag, 0}};
         pipe.send(RADIO_LINK_HELLO, {reinterpret_cast<const uint8_t *>(&hello), sizeof(hello)});
-        say("client connected");
+        say("client connected (shm=%u)", static_cast<unsigned>(shm_flag));
         radio_link_header h{};
         while (!g_stop && pipe.read_exact(&h, sizeof(h))) {
           if (h.length > RADIO_LINK_MAX_PAYLOAD) break;

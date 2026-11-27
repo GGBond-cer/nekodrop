@@ -68,6 +68,15 @@ foreach ($f in @(@('mediatek/WIFI_MT7922_patch_mcu_1_1_hdr.bin', '5356256C3A361C
 }
 "linux-firmware (MT7922/MT7921) @ $($lfw.Substring(0, 7))"
 
+$mt7925Fw = Join-Path $tp 'linux-firmware-mt7925'
+New-Item -ItemType Directory -Force $mt7925Fw | Out-Null
+foreach ($f in @(@('WIFI_RAM_CODE_MT7925_1_1.bin', '329C0E27F780550789E4EBA47452731B1723F69F9E67F525D0E50BF3CD2978AC'),
+                 @('WIFI_MT7925_PATCH_MCU_1_1_hdr.bin', '67FF85F1A39D1A100A51ABD8E2A26EDD2F198D7052514B6B8981948B231E5016'))) {
+  Get-File "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/$lfw/mediatek/mt7925/$($f[0])" `
+           (Join-Path $mt7925Fw $f[0]) $f[1]
+}
+"linux-firmware (MT7925) @ $($lfw.Substring(0, 7))"
+
 # Experimental Intel BE200 (GL/FM) API 100 firmware (embeds PNVM in TLV 74).
 $be200Fw = Join-Path $tp 'linux-firmware-iwlwifi-be200'
 New-Item -ItemType Directory -Force $be200Fw | Out-Null

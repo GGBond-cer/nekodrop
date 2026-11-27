@@ -67,7 +67,7 @@ Uses your laptop or desktop's built-in PCIe / CNVi Wi-Fi card — no external US
 |---|---|---|---|---|
 | **Intel** | `iwxradio` | AX201 · AX200 · AX210 · AX211 · AX203 (Arrow Lake) · AX411 / Killer AX1690 · 9560 · 9462 | Concurrent Wi-Fi / On demand | ✅ **Tested** (AX201 by the author; AX200 / AX210 / AX211 / AX203, etc. by community) |
 | **Intel** | `iwxradio` | BE200 (Wi-Fi 7, MLD) | Concurrent Wi-Fi / On demand | 🧪 Experimental |
-| **MediaTek / AMD** | `mtradio` | MT7902 | 5 GHz Concurrent Wi-Fi / On demand | ✅ Tested both ways |
+| **MediaTek / AMD** | `mtradio` | MT7902 · MT7925 | 5 GHz Concurrent Wi-Fi / On demand | ✅ Tested both ways |
 | **MediaTek / AMD** | `mtkradio` | MT7922 / AMD RZ616 | 5 GHz Concurrent Wi-Fi (exp.) / On demand | ✅ Tested both ways |
 | **MediaTek / AMD** | `mtkradio` | MT7921 / AMD RZ608 | On demand | 🧪 Experimental |
 | **Realtek** | `devourer` | RTL8852CE | On demand | ✅ Community-tested (~24.5 MB/s) |

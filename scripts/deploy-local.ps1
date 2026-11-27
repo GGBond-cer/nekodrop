@@ -6,9 +6,10 @@ $repo = Split-Path $PSScriptRoot -Parent
 Start-Transcript "$repo\build\deploy.log" -Force | Out-Null
 try {
   Stop-Service NekoDropService -Force -ErrorAction SilentlyContinue
-  Get-Process NekoDropService, nekodrop-radio, awdld -ErrorAction SilentlyContinue | Stop-Process -Force
+  Get-Process NekoDropService, nekodrop-radio, nekodrop-radio-rtl, nekodrop-radio-mt, nekodrop-radio-mtk, awdld -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep 2
-  Copy-Item "$repo\build\stage\radio\nekodrop-radio.exe" "$Target\radio\" -Force
+  Copy-Item "$repo\build\stage\radio\nekodrop-radio*.exe" "$Target\radio\" -Force
+  Copy-Item "$repo\build\stage\awdl\awdld.exe" "$Target\awdl\" -Force -ErrorAction SilentlyContinue
   Copy-Item "$repo\build\stage\NekoDropService.exe" "$Target\" -Force
   # The client and the AirDrop engine too; the user's client is started again afterwards.
   Get-Process nekodrop -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -22,7 +23,7 @@ try {
     Set-NetFirewallRule -LocalPort 8771-8779
   Set-Service NekoDropService -StartupType Automatic
   Start-Service NekoDropService
-  Get-Item "$Target\radio\nekodrop-radio.exe", "$Target\NekoDropService.exe" | Select-Object Name, LastWriteTime
+  Get-Item "$Target\radio\nekodrop-radio*.exe", "$Target\NekoDropService.exe" -ErrorAction SilentlyContinue | Select-Object Name, LastWriteTime
   'deployed'
 } catch { $_ | Out-String }
 Stop-Transcript | Out-Null
