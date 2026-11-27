@@ -432,7 +432,7 @@ $svcStart = Try-Get { (Get-CimInstance Win32_Service -Filter "Name='NekoDropServ
 $exe = Join-Path $app 'NekoDropService.exe'
 $version = Try-Get { (Get-Item $exe).VersionInfo.ProductVersion }
 $config = Try-Get { Get-Content (Join-Path $state 'service.json') -Raw | ConvertFrom-Json }
-$SupportedCardPattern = '^PCI\\(?:VEN_8086&DEV_(' + ($SupportedIntelIds -join '|') + ')|VEN_8086&DEV_272B|VEN_10EC&DEV_C852|VEN_14C3&DEV_(7902|7961|0608|7922|0616|7925))(?=&|\\|$)'
+$SupportedCardPattern = '^PCI\\(?:VEN_8086&DEV_(' + ($SupportedIntelIds -join '|') + ')|VEN_10EC&DEV_C852|VEN_14C3&DEV_(7902|7961|0608|7922|0616|7925))(?=&|\\|$)'
 # Every present device once: the supported card and the other wireless cards
 # below both come from it.
 $pnpAll = @(Try-Get { Get-PnpDevice -PresentOnly } | Where-Object { $_ })
