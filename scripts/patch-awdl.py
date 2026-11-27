@@ -12,6 +12,9 @@
 # - Experimental high-throughput flags (-H for Apple AWDL TLV 12 Wi-Fi 6 HE80
 #   capability on 5 GHz 80 MHz; -M <mtu> for Wintun MTU up to 1500, inspired by
 #   YiHoooong/owly feat/windows-mtkradio, #65). Both stay off/1450 unless passed.
+# - OWL RX safety fixes: bounded 512-entry A-MSDU frame output vector, exact
+#   Ethernet frame allocation + write check, unconditional cleanup on partial
+#   A-MSDU decode failure, malloc NULL checks, and initialized rssi/flags.
 #
 # Idempotent; exits with an error when the source no longer matches.
 import pathlib
@@ -654,4 +657,220 @@ patch_once(
     '\t\treturn RX_UNEXPECTED_FORMAT;\n'
     '\t}\n',
     'owl rx.c unwrap RFC 1042-encapsulated 802.3 AWDL A-MSDU subframes',
+)
+
+# 10. upstream/owl: RX A-MSDU bounds checking, exact-sized Ethernet allocation,
+#     unconditional cleanup on partial A-MSDU errors, malloc NULL checks, and
+#     initialized rssi/flags in awdl_rx().
+owl_wire_c = root / 'upstream' / 'owl' / 'src' / 'wire.c'
+owl_rx_h = root / 'upstream' / 'owl' / 'src' / 'rx.h'
+owl_core_c = root / 'upstream' / 'owl' / 'daemon' / 'core.c'
+
+patch_once(
+    owl_wire_c,
+    'if (!buf->data && len)',
+    'struct buf *buf_new_owned(int len) {\n'
+    '\tif (len < 0)\n'
+    '\t\treturn NULL;\n'
+    '\tstruct buf *buf = (struct buf *) malloc(sizeof(struct buf));\n'
+    '\tbuf->data = (uint8_t *) malloc(len);\n'
+    '\tbuf->orig = buf->data;\n'
+    '\tbuf->len = len;\n'
+    '\tbuf->owned = 1;\n'
+    '\treturn buf;\n'
+    '}\n'
+    '\n'
+    'const struct buf *buf_new_const(const uint8_t *data, int len) {\n'
+    '\tif (len < 0)\n'
+    '\t\treturn NULL;\n'
+    '\tstruct buf *buf = (struct buf *) malloc(sizeof(struct buf));\n',
+    'struct buf *buf_new_owned(int len) {\n'
+    '\tif (len < 0)\n'
+    '\t\treturn NULL;\n'
+    '\tstruct buf *buf = (struct buf *) malloc(sizeof(struct buf));\n'
+    '\tif (!buf)\n'
+    '\t\treturn NULL;\n'
+    '\tbuf->data = (uint8_t *) malloc(len);\n'
+    '\tif (!buf->data && len) {\n'
+    '\t\tfree(buf);\n'
+    '\t\treturn NULL;\n'
+    '\t}\n'
+    '\tbuf->orig = buf->data;\n'
+    '\tbuf->len = len;\n'
+    '\tbuf->owned = 1;\n'
+    '\treturn buf;\n'
+    '}\n'
+    '\n'
+    'const struct buf *buf_new_const(const uint8_t *data, int len) {\n'
+    '\tif (len < 0)\n'
+    '\t\treturn NULL;\n'
+    '\tstruct buf *buf = (struct buf *) malloc(sizeof(struct buf));\n'
+    '\tif (!buf)\n'
+    '\t\treturn NULL;\n',
+    'owl wire.c NULL checks in buf_new_owned/buf_new_const',
+)
+
+patch_once(
+    owl_rx_h,
+    'struct awdl_rx_frames',
+    'int awdl_rx_data(const struct buf *frame, struct buf ***out,\n'
+    '                 const struct ether_addr *src, const struct ether_addr *dst, struct awdl_state *state);\n'
+    '\n'
+    'int awdl_rx_data_amsdu(const struct buf *frame, struct buf ***out,\n'
+    '                       const struct ether_addr *src, const struct ether_addr *dst, struct awdl_state *state);\n'
+    '\n'
+    '/** @brief Receive and process AWDL action and data frame\n'
+    ' *\n'
+    ' * @param frame input frame\n'
+    ' * @param data if {@code frame} points to a valid AWDL data frame, will point to converted Ethernet frame after function returns\n'
+    ' * @param state\n'
+    ' * @return RX_OK\n'
+    ' */\n'
+    'int awdl_rx(const struct buf *frame, struct buf ***data_frames, struct awdl_state *state);\n',
+    'struct awdl_rx_frames {\n'
+    '\tstruct buf **next;\n'
+    '\tstruct buf **end;\n'
+    '};\n'
+    '\n'
+    'int awdl_rx_data(const struct buf *frame, struct awdl_rx_frames *out,\n'
+    '                 const struct ether_addr *src, const struct ether_addr *dst, struct awdl_state *state);\n'
+    '\n'
+    'int awdl_rx_data_amsdu(const struct buf *frame, struct awdl_rx_frames *out,\n'
+    '                       const struct ether_addr *src, const struct ether_addr *dst, struct awdl_state *state);\n'
+    '\n'
+    '/** @brief Receive and process AWDL action and data frame\n'
+    ' *\n'
+    ' * @param frame input frame\n'
+    ' * @param data_frames output Ethernet frames in [next, end). The caller frees each\n'
+    ' *        appended frame, including when a later A-MSDU subframe fails to decode.\n'
+    ' * @param state\n'
+    ' * @return RX_OK\n'
+    ' */\n'
+    'int awdl_rx(const struct buf *frame, struct awdl_rx_frames *data_frames, struct awdl_state *state);\n',
+    'owl rx.h bounded struct awdl_rx_frames output',
+)
+
+patch_once(
+    owl_rx_c,
+    'if (!tlv_buf)\n\t\t\treturn RX_UNEXPECTED_VALUE;',
+    '\twhile ((len = read_tlv(frame, 0, &tlv_type, &tlv_len, &tlv_value)) > 0) {\n'
+    '\t\tconst struct buf *tlv_buf = buf_new_const(tlv_value, tlv_len);\n',
+    '\twhile ((len = read_tlv(frame, 0, &tlv_type, &tlv_len, &tlv_value)) > 0) {\n'
+    '\t\tconst struct buf *tlv_buf = buf_new_const(tlv_value, tlv_len);\n'
+    '\t\tif (!tlv_buf)\n'
+    '\t\t\treturn RX_UNEXPECTED_VALUE;\n',
+    'owl rx.c NULL check on tlv_buf',
+)
+
+patch_once(
+    owl_rx_c,
+    'int awdl_rx_data(const struct buf *frame, struct awdl_rx_frames *out,',
+    'int awdl_rx_data(const struct buf *frame, struct buf ***out, const struct ether_addr *src,\n',
+    'int awdl_rx_data(const struct buf *frame, struct awdl_rx_frames *out, const struct ether_addr *src,\n',
+    'owl rx.c awdl_rx_data bounded output signature',
+)
+
+patch_once(
+    owl_rx_c,
+    'buf_new_owned(2 * ETHER_ADDR_LEN + 2 + buf_len(frame))',
+    '\t**out = buf_new_owned(ETHER_MAX_LEN);\n'
+    '\n'
+    '\t/* TODO use checked write methods */\n'
+    '\toffset += write_ether_addr(**out, offset, dst);\n'
+    '\toffset += write_ether_addr(**out, offset, src);\n'
+    '\toffset += write_be16(**out, offset, ether_type);\n'
+    '\t/* TODO avoid copying bytes */\n'
+    '\toffset += write_bytes(**out, offset, buf_data(frame), buf_len(frame));\n'
+    '\n'
+    '\t(*out)++;\n',
+    '\tif (out->next == out->end)\n'
+    '\t\treturn RX_UNEXPECTED_VALUE;\n'
+    '\tstruct buf *ethernet = buf_new_owned(2 * ETHER_ADDR_LEN + 2 + buf_len(frame));\n'
+    '\tif (!ethernet)\n'
+    '\t\treturn RX_UNEXPECTED_VALUE;\n'
+    '\toffset += write_ether_addr(ethernet, offset, dst);\n'
+    '\toffset += write_ether_addr(ethernet, offset, src);\n'
+    '\toffset += write_be16(ethernet, offset, ether_type);\n'
+    '\tif (write_bytes(ethernet, offset, buf_data(frame), buf_len(frame)) < 0) {\n'
+    '\t\tbuf_free(ethernet);\n'
+    '\t\treturn RX_UNEXPECTED_FORMAT;\n'
+    '\t}\n'
+    '\t*out->next++ = ethernet;\n',
+    'owl rx.c bounds check and exact-sized Ethernet allocation',
+)
+
+patch_once(
+    owl_rx_c,
+    'int awdl_rx_data_amsdu(const struct buf *frame, struct awdl_rx_frames *out,',
+    'int awdl_rx_data_amsdu(const struct buf *frame, struct buf ***out, const struct ether_addr *src __attribute__((unused)),\n',
+    'int awdl_rx_data_amsdu(const struct buf *frame, struct awdl_rx_frames *out, const struct ether_addr *src __attribute__((unused)),\n',
+    'owl rx.c awdl_rx_data_amsdu bounded output signature',
+)
+
+patch_once(
+    owl_rx_c,
+    'if (!subframe)\n\t\t\treturn RX_UNEXPECTED_VALUE;',
+    '\t\t/* create subview of buf */\n'
+    '\t\tsubframe = buf_new_const(buf_data(frame), len_a);\n',
+    '\t\t/* create subview of buf */\n'
+    '\t\tsubframe = buf_new_const(buf_data(frame), len_a);\n'
+    '\t\tif (!subframe)\n'
+    '\t\t\treturn RX_UNEXPECTED_VALUE;\n',
+    'owl rx.c NULL check on A-MSDU subframe',
+)
+
+patch_once(
+    owl_rx_c,
+    'int awdl_rx(const struct buf *frame, struct awdl_rx_frames *data_frame,',
+    'int awdl_rx(const struct buf *frame, struct buf ***data_frame, struct awdl_state *state) {\n'
+    '\tconst struct ieee80211_hdr *ieee80211;\n'
+    '\tconst struct ether_addr *from, *to;\n'
+    '\tuint16_t fc, qosc; /* frame and QoS control */\n'
+    '\tsigned char rssi;\n'
+    '\tuint64_t tsft;\n'
+    '\tuint8_t flags;\n',
+    'int awdl_rx(const struct buf *frame, struct awdl_rx_frames *data_frame, struct awdl_state *state) {\n'
+    '\tconst struct ieee80211_hdr *ieee80211;\n'
+    '\tconst struct ether_addr *from, *to;\n'
+    '\tuint16_t fc, qosc; /* frame and QoS control */\n'
+    '\tsigned char rssi = 0;\n'
+    '\tuint64_t tsft;\n'
+    '\tuint8_t flags = 0;\n',
+    'owl rx.c bounded awdl_rx signature and initialized rssi/flags',
+)
+
+patch_once(
+    owl_core_c,
+    'struct awdl_rx_frames data = {packets, packets + 512};',
+    'void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint8_t *buf) {\n'
+    '#define MAX_NUM_AMPDU 16 /* TODO lookup this constant from the standard */\n'
+    '\tstruct daemon_state *state = (void *) user;\n'
+    '\tint result;\n'
+    '\tconst struct buf *frame = buf_new_const(buf, hdr->caplen);\n'
+    '\tstruct buf *data_arr[MAX_NUM_AMPDU];\n'
+    '\tstruct buf **data = &data_arr[0];\n'
+    '\tresult = awdl_rx(frame, &data, &state->awdl_state);\n'
+    '\tif (result == RX_OK) {\n'
+    '\t\tfor (struct buf **data_start = &data_arr[0]; data_start < data; data_start++) {\n'
+    '\t\t\thost_send(&state->io, buf_data(*data_start), buf_len(*data_start));\n'
+    '\t\t\tbuf_free(*data_start);\n'
+    '\t\t}\n'
+    '\t} else if (result < RX_OK) {\n',
+    'void awdl_receive_frame(uint8_t *user, const struct pcap_pkthdr *hdr, const uint8_t *buf) {\n'
+    '\tstruct daemon_state *state = (void *) user;\n'
+    '\tconst struct buf *frame = buf_new_const(buf, hdr->caplen);\n'
+    '\tif (!frame)\n'
+    '\t\treturn;\n'
+    '\t/* Every nonfinal A-MSDU subframe occupies at least 32 bytes (Ethernet\n'
+    '\t * subheader, LLC, AWDL, alignment). 512 pointers cover a 16 KiB MPDU. */\n'
+    '\tstruct buf *packets[512];\n'
+    '\tstruct awdl_rx_frames data = {packets, packets + 512};\n'
+    '\tint result = awdl_rx(frame, &data, &state->awdl_state);\n'
+    '\tfor (struct buf **packet = packets; packet < data.next; packet++) {\n'
+    '\t\tif (result == RX_OK)\n'
+    '\t\t\thost_send(&state->io, buf_data(*packet), buf_len(*packet));\n'
+    '\t\tbuf_free(*packet);\n'
+    '\t}\n'
+    '\tif (result < RX_OK) {\n',
+    'owl core.c 512-entry bounded RX vector and unconditional cleanup',
 )
