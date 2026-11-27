@@ -50,6 +50,34 @@ public static class Wlan
     }
 
     /// <summary>
+    /// True when Windows reports a connected WLAN interface. Wlan.Current can
+    /// fail to read the connection details right after the card is handed back,
+    /// although the interface itself is already connected. Callers must not
+    /// send another WlanConnect in that state: it would cancel the association
+    /// Windows has just completed.
+    /// </summary>
+    public static bool IsConnected()
+    {
+        if (WlanOpenHandle(2, IntPtr.Zero, out _, out var h) != 0) return false;
+        try
+        {
+            if (WlanEnumInterfaces(h, IntPtr.Zero, out var listPtr) != 0) return false;
+            try
+            {
+                int count = Marshal.ReadInt32(listPtr);
+                for (int i = 0; i < count; i++)
+                {
+                    var state = Marshal.ReadInt32(listPtr + 8 + i * 532 + 16 + 512);
+                    if (state == 1 /* wlan_interface_state_connected */) return true;
+                }
+                return false;
+            }
+            finally { WlanFreeMemory(listPtr); }
+        }
+        finally { WlanCloseHandle(h, IntPtr.Zero); }
+    }
+
+    /// <summary>
     /// True while Windows is already associating, discovering or authenticating
     /// on a WLAN interface: worth waiting a moment instead of cutting it off,
     /// without calling WlanConnect on saved profiles (#4).
@@ -396,6 +424,21 @@ public static class Wlan
                     (current.Ssid == wanted ? "" : $" (not \"{wanted}\"; leaving it)"));
                 return true;
             }
+            // WlanQueryInterface can fail while the interface is already
+            // connected. Do not mistake that for "not connected": another
+            // WlanConnect would cancel the association Windows just made.
+            if (IsConnected())
+            {
+                if (Ipv4Ready())
+                {
+                    say($"Wi-Fi: Windows is connected; IPv4 is ready" +
+                        (lastWhy.Length > 0 ? $" (connection details: {lastWhy})" : ""));
+                    return true;
+                }
+                if (DateTime.UtcNow >= deadline) break;
+                if (token.WaitHandle.WaitOne(1000)) return false;
+                continue;
+            }
             if (DateTime.UtcNow >= deadline) break;
             // WlanConnect while Windows is associating cancels that association
             // ("the user wants to establish a new connection"), so wait for it.
@@ -437,8 +480,12 @@ public static class Wlan
             }
             if (token.WaitHandle.WaitOne(1000)) return false;
         }
-        say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own" +
-            (lastWhy.Length > 0 ? $" (last state: {lastWhy})" : ""));
+        if (IsConnected())
+            say("Wi-Fi: Windows is connected, but IPv4/DHCP did not become ready" +
+                (lastWhy.Length > 0 ? $" (last state: {lastWhy})" : ""));
+        else
+            say($"Wi-Fi: Windows did not reconnect to \"{wanted}\" on its own" +
+                (lastWhy.Length > 0 ? $" (last state: {lastWhy})" : ""));
         return false;
     }
 
