@@ -59,11 +59,7 @@ Name: "{autoprograms}\nekodrop - diagnostic report"; Filename: "{app}\report.cmd
 [Run]
 ; Started as the signed-in user: the first start registers the Explorer
 ; "用 nekodrop 发送" menu, Send To and the notification protocol for that user.
-Filename: "{app}\nekodrop.exe"; Description: "{cm:StartNow}"; Flags: postinstall nowait skipifsilent runasoriginaluser
-; An update started from nekodrop runs silently: start the new version again,
-; either with its main panel (the update setting) or in the background.
-Filename: "{app}\nekodrop.exe"; Flags: nowait runasoriginaluser; Check: ShouldLaunchWindow
-Filename: "{app}\nekodrop.exe"; Parameters: "--background"; Flags: nowait runasoriginaluser; Check: ShouldLaunchBackground
+Filename: "{app}\nekodrop.exe"; Description: "{cm:StartNow}"; Flags: postinstall nowait skipifsilent runasoriginaluser; Check: InstalledSuccessfully
 
 [UninstallRun]
 Filename: "{app}\nekodrop.exe"; Parameters: "--unregister"; Flags: waituntilterminated skipifdoesntexist runhidden; RunOnceId: "nekodrop-unregister"
@@ -86,14 +82,9 @@ begin
       Result := True;
 end;
 
-function ShouldLaunchWindow: Boolean;
+function InstalledSuccessfully: Boolean;
 begin
-  Result := WizardSilent and CommandLineHas('/SHOWAPP');
-end;
-
-function ShouldLaunchBackground: Boolean;
-begin
-  Result := WizardSilent and not CommandLineHas('/SHOWAPP');
+  Result := not InstallFailed;
 end;
 
 function GetCustomSetupExitCode: Integer;
@@ -109,12 +100,13 @@ var
   Code: Integer;
   Lines: TArrayOfString;
   Err: String;
-  Log: String;
+  LogPath: String;
+  LaunchArgs: String;
   I: Integer;
 begin
   if CurStep <> ssPostInstall then Exit;
   WizardForm.StatusLabel.Caption := CustomMessage('Installing');
-  Log := ExpandConstant('{commonappdata}\nekodrop\install.log');
+  LogPath := ExpandConstant('{commonappdata}\nekodrop\install.log');
   // The files are copied by now, so the bar stood full and still for the half
   // minute or more the driver, TAP and service take, and looked stuck (#45):
   // let it run while install.ps1 works.
@@ -140,6 +132,15 @@ begin
     Err := Trim(Err);
     if Err = '' then
       Err := 'install.ps1 exit code ' + IntToStr(Code);
-    SuppressibleMsgBox(FmtMessage(CustomMessage('Failed'), [Err, Log]), mbError, MB_OK, IDOK);
+    SuppressibleMsgBox(FmtMessage(CustomMessage('Failed'), [Err, LogPath]), mbError, MB_OK, IDOK);
+  end
+  else if WizardSilent then
+  begin
+    // Non-postinstall [Run] entries execute before this hook copies the new client.
+    LaunchArgs := '--background';
+    if CommandLineHas('/SHOWAPP') then LaunchArgs := '';
+    if not ExecAsOriginalUser(ExpandConstant('{app}\nekodrop.exe'), LaunchArgs,
+        ExpandConstant('{app}'), SW_SHOWNORMAL, ewNoWait, Code) then
+      Log(Format('Could not start the installed client (error %d).', [Code]));
   end;
 end;
