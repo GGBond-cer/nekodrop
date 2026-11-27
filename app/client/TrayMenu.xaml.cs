@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shapes;
 
@@ -15,6 +18,8 @@ public partial class TrayMenu : Window
 {
     static App A => App.Instance;
     bool _closing;
+    IntPtr _trayFlyout;
+    readonly System.Windows.Threading.DispatcherTimer _trayWatch = new() { Interval = TimeSpan.FromMilliseconds(100) };
 
     public TrayMenu()
     {
@@ -22,25 +27,56 @@ public partial class TrayMenu : Window
         AllowItem.Tag = A.Model.Allow ? "" : "";
         AutoAcceptItem.Tag = A.Settings.AutoAcceptMode != "off" ? "" : "";
         Deactivated += (_, _) => Shut();
+        SourceInitialized += (_, _) =>
+        {
+            if (_trayFlyout == IntPtr.Zero) return;
+            var hwnd = new WindowInteropHelper(this).Handle;
+            SetWindowLong(hwnd, GWL_EXSTYLE, GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+        };
+        _trayWatch.Tick += (_, _) => { if (!IsWindowVisible(_trayFlyout)) Shut(); };
     }
 
     /// <summary>Shows the menu with its lower right corner at the pointer, inside the work area.</summary>
     public void ShowAt(Point pointer)
     {
+        var foreground = GetForegroundWindow();
+        var className = new StringBuilder(64);
+        GetClassName(foreground, className, className.Capacity);
+        if (className.ToString() is "TopLevelWindowForOverflowXamlIsland" or "NotifyIconOverflowWindow") _trayFlyout = foreground;
         Show();
         UpdateLayout();
         var area = SystemParameters.WorkArea;
         Left = Math.Max(area.Left, Math.Min(pointer.X - ActualWidth + 10, area.Right - ActualWidth));
         Top = Math.Max(area.Top, Math.Min(pointer.Y - ActualHeight + 10, area.Bottom - ActualHeight));
-        Activate();
+        if (_trayFlyout == IntPtr.Zero) Activate();
+        else _trayWatch.Start();
     }
 
     void Shut()
     {
         if (_closing) return;
         _closing = true;
+        _trayWatch.Stop();
         Close();
     }
+
+    const int GWL_EXSTYLE = -20;
+    const int WS_EX_NOACTIVATE = 0x08000000;
+
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern int GetClassName(IntPtr hwnd, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+    static extern int GetWindowLong(IntPtr hwnd, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongW")]
+    static extern int SetWindowLong(IntPtr hwnd, int index, int value);
+
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hwnd);
 
     /// <summary>Opens the network mode panel (also for --snapshot).</summary>
     internal void OpenModes() { if (ModePanel.Visibility != Visibility.Visible) Mode_Click(this, new RoutedEventArgs()); }
