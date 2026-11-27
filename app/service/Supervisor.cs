@@ -446,6 +446,7 @@ public sealed class Supervisor : IDisposable
     {
         lock (_lock)
         {
+            if (_cts.IsCancellationRequested) return;
             if (_wanted && State is RadioState.On or RadioState.Starting) return;
             _wanted = true;
             _holdFirmwareRetry = false;
@@ -607,10 +608,11 @@ public sealed class Supervisor : IDisposable
             var launch = CardCatalog.BuildRadioLaunch(_profile, channel, kernel, _cfg.Country, staConf, true, _cfg.FastUnlock,
                                                       _cfg.CoexPlan, btCoexBalanced: true, highThroughput: _cfg.HighThroughput);
             _startedAt = DateTime.UtcNow;
-            _radio = Spawn(Path.Combine(_root, "radio", launch.ExeName), launch.Args, OnRadioLine);
+            var radio = _radio = Spawn(Path.Combine(_root, "radio", launch.ExeName), launch.Args, OnRadioLine);
             // awdld connects to the radio's pipe; give the firmware time to boot.
-            for (int i = 0; i < 100 && State == RadioState.Starting && _radio is { HasExited: false }; i++) Thread.Sleep(100);
-            if (_radio is null || _radio.HasExited) throw new InvalidOperationException("the radio exited during bring-up: " + _detail);
+            for (int i = 0; i < 100 && _wanted && State == RadioState.Starting && !radio.HasExited; i++) Thread.Sleep(100);
+            if (!_wanted) return;
+            if (radio.HasExited) throw new InvalidOperationException("the radio exited during bring-up: " + _detail);
             string[] awdlArgs = _cfg.HighThroughput
                 ? ["-c", channel.ToString(), "-H", "-M", "1500"]
                 : ["-c", channel.ToString()];
@@ -1590,7 +1592,6 @@ public sealed class Supervisor : IDisposable
     public void Dispose()
     {
         _cts.Cancel();
-        KillDaemons();
-        if (EffectiveMode() != NetMode.Concurrent) EnsureVendorDriver();
+        Stop("service stopped", giveBack: EffectiveMode() != NetMode.Concurrent);
     }
 }
