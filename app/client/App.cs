@@ -82,6 +82,16 @@ public sealed class App : Application
     readonly Dictionary<string, (string FromName, List<string> TempPaths)> _relayOrigin = [];
     /// <summary>Incoming requests from a relay end, and the other end their files go to.</summary>
     readonly Dictionary<string, RelayEnd> _relayTo = [];
+    /// <summary>Active AirDrop send/receive IDs; while non-empty, MTA BLE active scanning yields to AWDL.</summary>
+    readonly HashSet<string> _airDropActive = new(StringComparer.Ordinal);
+
+    static bool IsAirDropRequestId(string id) => !MtaEngine.IsMtaRequest(id) && !LocalSendEngine.IsRequest(id);
+
+    void SyncMtaRadioYield()
+    {
+        var needsMtaRelay = _relayTo.Values.Any(r => r.Protocol == RelayEnd.Mta);
+        Mta.SetRadioYield(_airDropActive.Count > 0 && !needsMtaRelay);
+    }
 
     public List<RelayRule> RelayRules => Relay.Load(Settings.RelayRules);
     /// <summary>The rules that work now, or none while the relay is off.</summary>
@@ -739,6 +749,8 @@ public sealed class App : Application
     /// <summary>The engine again (a new identity, or Contacts Only switched): it reads both when it starts.</summary>
     public void RestartEngine()
     {
+        _airDropActive.Clear();
+        SyncMtaRadioYield();
         Engine.Dispose();
         if (Settings.Discoverable) StartEngine();
     }
@@ -785,7 +797,7 @@ public sealed class App : Application
         Mta.Apply(Settings);
         LocalSend.Apply(Settings);
         if (on) { StartEngine(); Service.Wake(); }
-        else Engine.Dispose();
+        else { _airDropActive.Clear(); SyncMtaRadioYield(); Engine.Dispose(); }
     }
 
     public void ApplyMta()
@@ -1043,7 +1055,13 @@ public sealed class App : Application
     {
         if (MtaEngine.IsMtaRequest(id)) Mta.Answer(id, accept);
         else if (LocalSendEngine.IsRequest(id)) LocalSend.Answer(id, accept);
-        else Engine.Answer(id, accept);
+        else
+        {
+            if (accept) _airDropActive.Add(id);
+            else _airDropActive.Remove(id);
+            SyncMtaRadioYield();
+            Engine.Answer(id, accept);
+        }
         if (_requests.TryGetValue(id, out var r))
         {
             r.Status = accept ? L.T("req.receiving") : L.T("req.declined");
@@ -1159,6 +1177,8 @@ public sealed class App : Application
         if (radio == "on" && _lastRadio != "on" && _lastRadio != "" && Settings.Discoverable &&
             !(Engine.Running && _engineIf < 0))
         {
+            _airDropActive.Clear();
+            SyncMtaRadioYield();
             Engine.Dispose();
             StartEngine();
         }
@@ -1296,6 +1316,7 @@ public sealed class App : Application
                 {
                     // Relay: find the other end while the sender is still uploading.
                     if (relayTo is not null) LookOn(relayTo.Protocol);
+                    if (IsAirDropRequestId(id)) { _airDropActive.Add(id); SyncMtaRadioYield(); }
                     if (waits)
                     {
                         if (MtaEngine.IsMtaRequest(id)) Mta.Answer(id, true);
@@ -1332,11 +1353,15 @@ public sealed class App : Application
                 var rxRate = Settings.ShowTransferSpeed ? UpdateSpeed(_rxSpeed, id, incDone) : null;
                 inc.Status = rxRate is not null ? $"{rxBase} · {rxRate}" : rxBase;
                 inc.Receiving = true;
+                if (IsAirDropRequestId(id) && _airDropActive.Add(id)) SyncMtaRadioYield();
                 Service.Touch();
                 break;
             case "stored":
             {
                 _rxSpeed.Remove(id);
+                var hadRelay = _relayTo.Remove(id, out var relayEnd);
+                _airDropActive.Remove(id);
+                SyncMtaRadioYield();
                 var folder = (string?)o["folder"] ?? Settings.SaveFolder;
                 var from = _requests.TryGetValue(id, out var st) ? st.Sender : _askSender.GetValueOrDefault(id, "AirDrop");
                 var askIcon = _askIcon.GetValueOrDefault(id);
@@ -1369,11 +1394,13 @@ public sealed class App : Application
                                                         string.Equals(Path.GetFileNameWithoutExtension(m), stem, StringComparison.OrdinalIgnoreCase));
                     if (mov is not null && pairedMovies.Add(mov)) livePairs[n] = mov;
                 }
-                _ = HandleStoredAsync(id, from, folder, names, livePairs, pairedMovies, askIcon, _relayTo.Remove(id, out var relayEnd) ? relayEnd : null);
+                _ = HandleStoredAsync(id, from, folder, names, livePairs, pairedMovies, askIcon, hadRelay ? relayEnd : null);
                 break;
             }
             case "lost":
                 _relayTo.Remove(id);
+                _airDropActive.Remove(id);
+                SyncMtaRadioYield();
                 _rxSpeed.Remove(id);
                 _askSender.Remove(id);
                 _askIcon.Remove(id);
@@ -1398,6 +1425,9 @@ public sealed class App : Application
                 if (!_sendInfo.TryGetValue(id, out var info)) break;
                 var d = Model.Devices.FirstOrDefault(x => x.Id == info.DeviceId);
                 var state = (string?)o["state"];
+                var isAirDropSend = !MtaEngine.IsMtaPeer(info.DeviceId) && !LocalSendEngine.IsPeer(info.DeviceId);
+                if (isAirDropSend && state is "sending" or "finishing" && _airDropActive.Add(id))
+                    SyncMtaRadioYield();
                 var reason = (string?)o["reason"] ?? "";
                 var failure = state == "failed" ? SendRules.FailureStatus(reason, info.Files) : "";
                 if (d is not null)
@@ -1421,6 +1451,7 @@ public sealed class App : Application
                 {
                     _txSpeed.Remove(id);
                     _sendInfo.Remove(id);
+                    if (_airDropActive.Remove(id)) SyncMtaRadioYield();
                     if (d is not null)
                     {
                         d.Busy = false;

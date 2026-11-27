@@ -63,12 +63,14 @@ public sealed class MtaEngine : IDisposable
     bool _enabled;
     bool _discoverable = true;
     bool _looking;
+    bool _radioYield;
     bool _disposed;
 
     // BLE GATT server (receive)
     GattServiceProvider? _g8881;
     GattServiceProvider? _g9999;
     GattLocalCharacteristic? _c9895;
+    bool _rxStarting;
     ECDiffieHellman? _rxEcdh;
     byte[] _rxStateBytes = [];
     ReceiveSession? _rxSession;
@@ -126,25 +128,27 @@ public sealed class MtaEngine : IDisposable
 
     public void Apply(Settings s)
     {
-        bool startAdv, stopAdv, startScan, stopScan;
+        bool startAdv, stopAdv, startScan, stopScan, clearPeers;
         lock (_lock)
         {
             if (_disposed) return;
             _deviceName = string.IsNullOrWhiteSpace(s.DeviceName) ? Environment.MachineName : s.DeviceName.Trim();
             _saveFolder = s.SaveFolder;
-            var wasEnabled = _enabled;
-            var wasAdv = _enabled && _discoverable;
+            var wasAdv = _enabled && _discoverable && !_radioYield;
+            var wasScan = _enabled && _looking && !_radioYield;
             _enabled = s.MtaOn;
             _discoverable = s.Discoverable;
-            var wantAdv = _enabled && _discoverable;
+            var wantAdv = _enabled && _discoverable && !_radioYield;
+            var wantScan = _enabled && _looking && !_radioYield;
             startAdv = wantAdv && !wasAdv;
             stopAdv = !wantAdv && wasAdv;
-            startScan = _enabled && _looking && !wasEnabled;
-            stopScan = !_enabled && wasEnabled;
+            startScan = wantScan && !wasScan;
+            stopScan = !wantScan && wasScan;
+            clearPeers = !_enabled;
         }
         if (stopAdv) StopReceiver();
         if (startAdv) _ = StartReceiverAsync();
-        if (stopScan) StopScanner(clearPeers: true);
+        if (stopScan || clearPeers) StopScanner(clearPeers: clearPeers);
         if (startScan) StartScanner();
     }
 
@@ -156,12 +160,46 @@ public sealed class MtaEngine : IDisposable
             if (_disposed) return;
             if (_looking == on) return;
             _looking = on;
-            if (!_enabled) return;
+            if (!_enabled || _radioYield) return;
             startScan = on;
             stopScan = !on;
         }
         if (startScan) StartScanner();
         if (stopScan) StopScanner(clearPeers: false);
+    }
+
+    /// <summary>
+    /// Temporarily pauses BLE active scanning and peripheral advertising while an AirDrop
+    /// transfer is active so combo Wi-Fi+BT adapters (e.g. Intel AX201) do not lose AWDL
+    /// airtime to BT-Coex arbitration. Keeps discovered MTA peers intact across the pause.
+    /// </summary>
+    public void SetRadioYield(bool yield)
+    {
+        bool stopScan = false, startScan = false, stopAdv = false, startAdv = false;
+        lock (_lock)
+        {
+            if (_disposed || _radioYield == yield) return;
+            _radioYield = yield;
+            if (yield)
+            {
+                stopScan = _watcher is not null;
+                stopAdv = (_g8881 is not null || _g9999 is not null) && _rxSession is null;
+            }
+            else
+            {
+                var now = DateTime.UtcNow;
+                foreach (var p in _peers.Values) p.LastSeen = now;
+                foreach (var p in _partials.Values) p.LastSeen = now;
+                startScan = _enabled && _looking && _watcher is null;
+                startAdv = _enabled && _discoverable && _g8881 is null && _g9999 is null;
+            }
+        }
+        if (stopScan) StopScanner(clearPeers: false);
+        if (stopAdv) StopReceiver();
+        if (yield && (stopScan || stopAdv)) Say("BLE yielded during AirDrop transfer");
+        if (!yield && (startScan || startAdv)) Say("BLE resumed after AirDrop transfer");
+        if (startAdv) _ = StartReceiverAsync();
+        if (startScan) StartScanner();
     }
 
     public void Answer(string id, bool accept)
@@ -217,7 +255,7 @@ public sealed class MtaEngine : IDisposable
     {
         lock (_lock)
         {
-            if (_watcher is not null || _disposed || !_enabled) return;
+            if (_watcher is not null || _disposed || !_enabled || _radioYield) return;
             try
             {
                 var w = new BluetoothLEAdvertisementWatcher
@@ -233,7 +271,7 @@ public sealed class MtaEngine : IDisposable
                     {
                         if (_watcher != watcher) return;
                         _watcher = null;
-                        restart = _enabled && _looking && !_disposed;
+                        restart = _enabled && _looking && !_radioYield && !_disposed;
                     }
                     if (restart)
                     {
@@ -380,6 +418,10 @@ public sealed class MtaEngine : IDisposable
 
     void PrunePeers()
     {
+        lock (_lock)
+        {
+            if (_radioYield) return;
+        }
         var cutoff = DateTime.UtcNow - PeerTtl;
         foreach (var (addr, p) in _partials)
             if (p.LastSeen < cutoff) _partials.TryRemove(addr, out _);
@@ -418,6 +460,12 @@ public sealed class MtaEngine : IDisposable
 
     async Task StartReceiverAsync()
     {
+        lock (_lock)
+        {
+            if (!_enabled || !_discoverable || _radioYield || _disposed || _rxStarting || _g8881 is not null) return;
+            _rxStarting = true;
+        }
+        bool cancelledMidFlight = false;
         try
         {
             var adapter = await BluetoothAdapter.GetDefaultAsync();
@@ -478,7 +526,7 @@ public sealed class MtaEngine : IDisposable
             bool stillWanted;
             lock (_lock)
             {
-                stillWanted = _enabled && _discoverable && !_disposed;
+                stillWanted = _enabled && _discoverable && !_radioYield && !_disposed;
                 if (stillWanted)
                 {
                     _g8881 = g8881;
@@ -486,14 +534,18 @@ public sealed class MtaEngine : IDisposable
                     _c9895 = c9895;
                 }
             }
-            if (!stillWanted) return;
+            if (!stillWanted)
+            {
+                cancelledMidFlight = true;
+                return;
+            }
 
             g8881.AdvertisementStatusChanged += (prov, args) =>
             {
                 if (args.Status == GattServiceProviderAdvertisementStatus.Aborted && args.Error != BluetoothError.Success)
                 {
                     bool restart;
-                    lock (_lock) restart = _g8881 == prov && _enabled && _discoverable && !_disposed;
+                    lock (_lock) restart = _g8881 == prov && _enabled && _discoverable && !_radioYield && !_disposed;
                     if (restart)
                     {
                         Say($"BLE 8881 aborted ({args.Error}); retrying in 3s");
@@ -501,7 +553,7 @@ public sealed class MtaEngine : IDisposable
                         {
                             bool stillAborted;
                             lock (_lock)
-                                stillAborted = _g8881 == prov && _enabled && _discoverable && !_disposed &&
+                                stillAborted = _g8881 == prov && _enabled && _discoverable && !_radioYield && !_disposed &&
                                                prov.AdvertisementStatus == GattServiceProviderAdvertisementStatus.Aborted;
                             if (!stillAborted) return;
                             StopReceiver();
@@ -518,6 +570,16 @@ public sealed class MtaEngine : IDisposable
         catch (Exception e)
         {
             Say($"StartReceiver failed: {e.GetType().Name}: {e.Message}");
+        }
+        finally
+        {
+            bool retry;
+            lock (_lock)
+            {
+                _rxStarting = false;
+                retry = cancelledMidFlight && _enabled && _discoverable && !_radioYield && !_disposed && _g8881 is null;
+            }
+            if (retry) _ = StartReceiverAsync();
         }
     }
 
