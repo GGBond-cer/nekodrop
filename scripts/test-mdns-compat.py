@@ -2,6 +2,7 @@
 """Packet tests for the patched IPv6-only AWDL mDNS responder (#51)."""
 
 import ipaddress
+import itertools
 from pathlib import Path
 import struct
 import sys
@@ -125,6 +126,94 @@ class AddressQueries(unittest.TestCase):
         self.assertEqual(len(ucast), 1)
         self.assertEqual(ucast[0], (SERVICE.response(), ('fe80::1', 5353, 0, 7)))
         self.assertEqual(mcast, [SERVICE.response(), SERVICE.response()])
+
+
+class QueryBursts(unittest.TestCase):
+    def replies(self, queries, tick=0.001):
+        incoming = []
+        for name, rtype, source, qu in queries:
+            packet = mdns.query([(name, rtype)])
+            if qu:
+                packet = packet[:-2] + b'\x80\x01'
+            sender = (source, mdns.PORT, 0, 7) if isinstance(source, str) else source
+            incoming.append((packet, sender))
+
+        with patch.object(mdns, 'open_socket') as open_socket:
+            announcer = mdns.Announcer(SERVICE, 7)
+            socket = open_socket.return_value
+
+            def receive(_):
+                if incoming:
+                    return incoming.pop(0)
+                announcer.stopping.set()
+                raise TimeoutError()
+
+            socket.recvfrom.side_effect = receive
+            with patch.object(mdns.time, 'monotonic', side_effect=itertools.count(0, tick)):
+                announcer._run()
+            return [call.args for call in socket.sendto.call_args_list]
+
+    def unicast_targets(self, queries):
+        multicast = (mdns.GROUP, mdns.PORT, 0, 7)
+        return [(packet, target[0]) for packet, target in self.replies(queries) if target != multicast]
+
+    def test_multicast_question_does_not_suppress_another_peers_qu_reply(self):
+        replies = self.unicast_targets([
+            (SERVICE.type_name, mdns.TYPE_PTR, 'fe80::2', False),
+            (SERVICE.instance_name, mdns.TYPE_SRV, 'fe80::3', True),
+        ])
+        self.assertEqual(replies, [(SERVICE.response(), 'fe80::3')])
+
+    def test_qu_suppression_keeps_unique_records_and_peers(self):
+        replies = self.unicast_targets([
+            (SERVICE.instance_name, mdns.TYPE_SRV, 'fe80::2', True),
+            (HOST, mdns.TYPE_AAAA, 'fe80::2', True),
+            (HOST, mdns.TYPE_AAAA, 'fe80::2', True),
+            (HOST, mdns.TYPE_AAAA, 'fe80::3', True),
+        ])
+        address_reply = SERVICE.address_response({mdns.TYPE_AAAA})
+        self.assertEqual(replies, [(SERVICE.response(), 'fe80::2'),
+                                   (address_reply, 'fe80::2'), (address_reply, 'fe80::3')])
+
+    def test_socket_sets_mdns_hop_limit_for_unicast_and_multicast(self):
+        with patch.object(mdns.socket, 'socket') as create:
+            mdns.open_socket(7)
+        options = [call.args for call in create.return_value.setsockopt.call_args_list]
+        for kind in (mdns.socket.IPV6_MULTICAST_HOPS, mdns.socket.IPV6_UNICAST_HOPS):
+            self.assertIn((mdns.socket.IPPROTO_IPV6, kind, 255), options)
+
+    def test_membership_and_announcements_use_only_scoped_ipv6(self):
+        with patch.object(mdns.socket, 'socket') as create:
+            mdns.open_socket(7)
+        create.assert_called_once_with(mdns.socket.AF_INET6, mdns.socket.SOCK_DGRAM)
+        sock = create.return_value
+        sock.bind.assert_called_once_with(('::', 5353))
+        sock.setsockopt.assert_any_call(mdns.socket.IPPROTO_IPV6, mdns.socket.IPV6_V6ONLY, 1)
+        groups = [value for (level, opt, value), _ in sock.setsockopt.call_args_list
+                  if level == mdns.socket.IPPROTO_IPV6 and opt == mdns.socket.IPV6_JOIN_GROUP]
+        self.assertEqual(groups, [ipaddress.IPv6Address('ff02::fb').packed + struct.pack('@I', 7)])
+        replies = self.replies([(SERVICE.type_name, mdns.TYPE_PTR, 'fe80::2', False)])
+        self.assertEqual({target for _, target in replies}, {('ff02::fb', 5353, 0, 7)})
+
+    def test_qu_caches_per_source_port_and_only_responds_on_its_interface(self):
+        def question(port, interface):
+            return HOST, mdns.TYPE_AAAA, ('fe80::2', port, 0, interface), True
+
+        queries = [question(5353, 9), question(40000, 7), question(40001, 7), question(40000, 7)]
+        targets = [target for _, target in self.replies(queries) if target[0] != mdns.GROUP]
+        self.assertEqual(targets, [('fe80::2', 40000, 0, 7), ('fe80::2', 40001, 0, 7)])
+
+    def test_qu_cache_expires_and_starts_empty_on_reopen(self):
+        question = (HOST, mdns.TYPE_AAAA, 'fe80::2', True)
+        for _ in range(2):
+            replies = self.replies([question, question], tick=mdns.MIN_REPLY_GAP_S)
+            targets = [target for _, target in replies if target[0] == 'fe80::2']
+            self.assertEqual(targets, [('fe80::2', 5353, 0, 7)] * 2)
+
+    def test_query_burst_cache_is_bounded(self):
+        queries = [(HOST, mdns.TYPE_AAAA, f'fe80::{i:x}', True) for i in range(1, 67)]
+        replies = self.replies(queries, tick=0.00001)
+        self.assertEqual(len([target for _, target in replies if target[0] != mdns.GROUP]), 64)
 
 
 if __name__ == '__main__':

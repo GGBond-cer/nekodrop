@@ -653,6 +653,62 @@ def question_names(packet):
     mdns.write_text(text, encoding='utf-8')
     print('mdns.py: IPv6-only host answers for macOS address queries')
 
+# Keep a burst of unrelated multicast questions from suppressing direct QU
+# replies. Bound recent unicast replies separately by recipient and packet.
+if 'MAX_RECENT_QU_REPLIES = 64' not in text:
+    pairs = [
+        (
+            'MIN_REPLY_GAP_S = 0.1\n',
+            'MIN_REPLY_GAP_S = 0.1\nMAX_RECENT_QU_REPLIES = 64\n',
+        ),
+        (
+            '        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)\n',
+            '        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_MULTICAST_HOPS, 255)\n'
+            '        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 255)\n',
+        ),
+        (
+            "        last_announce = last_reply = float('-inf')\n",
+            "        last_announce = last_reply = float('-inf')\n        recent_unicast = {}\n",
+        ),
+        (
+            '            if not asked or self.stopping.is_set() or now - last_reply < MIN_REPLY_GAP_S:\n',
+            '            if not asked or self.stopping.is_set():\n',
+        ),
+        (
+            """            else:
+                reply = announcement
+                last_announce = now
+            qu_target = getattr(self, '_last_qu_sender', None)
+            if qu_target is not None:
+                self._send_to(reply, qu_target)
+            self._send(reply)
+            last_reply = now""",
+            """            else:
+                reply = announcement
+            qu_target = getattr(self, '_last_qu_sender', None)
+            if qu_target is not None:
+                key = qu_target, reply
+                if now - recent_unicast.get(key, float('-inf')) >= MIN_REPLY_GAP_S:
+                    if len(recent_unicast) >= MAX_RECENT_QU_REPLIES:
+                        recent_unicast = {k: sent for k, sent in recent_unicast.items()
+                                          if now - sent < MIN_REPLY_GAP_S}
+                    if len(recent_unicast) < MAX_RECENT_QU_REPLIES:
+                        self._send_to(reply, qu_target)
+                        recent_unicast[key] = now
+            if now - last_reply >= MIN_REPLY_GAP_S:
+                self._send(reply)
+                last_reply = now
+                if reply is announcement:
+                    last_announce = now""",
+        ),
+    ]
+    for old, new in pairs:
+        if text.count(old) != 1:
+            sys.exit(f'mdns.py: {old[:60]!r} moved; update patch-engine.py')
+        text = text.replace(old, new, 1)
+    mdns.write_text(text, encoding='utf-8')
+    print('mdns.py: keep distinct unicast responses during query bursts')
+
 # Link sharing & media format support:
 # - Extract http(s) URLs from AirDrop Ask Items even when an app (e.g. Bilibili,
 #   Xiaohongshu, WeChat) wraps the link with title text or omits TransferType.links
