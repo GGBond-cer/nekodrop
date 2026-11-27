@@ -745,7 +745,7 @@ bool MtkDevice::rx_ring_pop(Ring &r, std::vector<uint8_t> &out, bool commit) {
   static constexpr size_t kMaxReasmBytes = 12288;
   MtkDesc *d = r.descs();
   out.clear();
-  for (;;) {
+  for (uint32_t scanned = 0; scanned < r.count; ++scanned) {
     const uint32_t idx = r.tail;
     const uint32_t ctrl = *static_cast<const volatile uint32_t *>(&d[idx].ctrl);
     if (!(ctrl & MT_DMA_CTL_DMA_DONE)) return false;
@@ -792,6 +792,7 @@ bool MtkDevice::rx_ring_pop(Ring &r, std::vector<uint8_t> &out, bool commit) {
 
     if (last_sec) return !out.empty();
   }
+  return false;
 }
 
 void MtkDevice::rx_ring_commit(Ring &r) {

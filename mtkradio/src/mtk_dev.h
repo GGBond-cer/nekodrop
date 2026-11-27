@@ -244,8 +244,10 @@ private:
   Logger _log;
   TxStatusHandler _on_tx_status;
   StopCheck _stopping;
-  RegProxy _proxy;
   DmaPool32 _dma;
+  // Close the RegProxy handle (including its emergency DMA stop) before
+  // destroying the DMA pool.
+  RegProxy _proxy;
 
   uint32_t _chip_id = 0;
   uint32_t _hw_rev = 0;

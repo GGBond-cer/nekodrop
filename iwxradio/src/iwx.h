@@ -363,8 +363,10 @@ private:
   void deliver_deferred();
   RxReorder _reorder;
   Options _opt;
-  RegProxy _proxy;
   DmaPool _dma;
+  // Close the RegProxy handle (including its emergency DMA stop) before
+  // destroying the DMA pool.
+  RegProxy _proxy;
   Firmware _fw;
 
   uint32_t _hw_rev = 0, _hw_rev_raw = 0, _hw_rf_id = 0;
