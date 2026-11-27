@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -297,6 +298,8 @@ bool parse_radiotap(const uint8_t *p, size_t len, RadiotapInfo &info) {
 constexpr uint16_t kStaEthernet = 0x100; /* inbox: a frame from the TAP adapter */
 constexpr uint16_t kScanRequest = 0x101; /* inbox: "scan" on stdin (the service's Wi-Fi list) */
 constexpr uint16_t kRejoinRequest = 0x102; /* inbox: "rejoin" on stdin (the service's gateway probe failed) */
+constexpr uint16_t kStaJoinRequest = 0x103; /* inbox: "join <sta.conf>" on stdin (hot station join) */
+constexpr uint16_t kStaLeaveRequest = 0x104; /* inbox: "leave" on stdin (hot station leave) */
 
 /* Networks heard in beacons and probe responses, for the client's Wi-Fi list. */
 struct BssSeen {
@@ -411,6 +414,16 @@ int main(int argc, char **argv) {
     while (!stopping() && std::fgets(line, sizeof(line), stdin)) {
       if (std::strncmp(line, "rejoin", 6) == 0) {
         inbox.push({kRejoinRequest, {}});
+        continue;
+      }
+      if (std::strncmp(line, "join ", 5) == 0) {
+        std::string path(line + 5);
+        while (!path.empty() && (path.back() == '\r' || path.back() == '\n')) path.pop_back();
+        inbox.push({kStaJoinRequest, std::vector<uint8_t>(path.begin(), path.end())});
+        continue;
+      }
+      if (std::strncmp(line, "leave", 5) == 0) {
+        inbox.push({kStaLeaveRequest, {}});
         continue;
       }
       if (std::strncmp(line, "scan", 4) != 0) continue;
@@ -895,16 +908,32 @@ int main(int argc, char **argv) {
     }
     listen_ms = GetTickCount64();
     std::thread tap_thread;
-    if (sta) {
-      std::string err;
-      if (!sta->start(sta_cfg, err)) {
-        log_line("station: " + err);
-        log_line("event: wifi failed");
+    std::atomic<bool> tap_run{false};
+    auto stop_station = [&] {
+      tap_run = false;
+      if (tap_thread.joinable()) tap_thread.join();
+      if (sta) {
+        sta->stop();
         sta.reset();
-      } else {
+      }
+    };
+    std::function<bool(const StaConfig &)> start_station;
+    if constexpr (caps.supports_station) {
+      start_station = [&](const StaConfig &cfg) {
+        stop_station();
+        if (!sta_dev) sta_dev.emplace(dev);
+        sta = std::make_unique<WifiStation>(*sta_dev, log_line);
+        std::string err;
+        if (!sta->start(cfg, err)) {
+          log_line("station: " + err);
+          log_line("event: wifi failed");
+          sta.reset();
+          return false;
+        }
+        tap_run = true;
         tap_thread = std::thread([&] {
           std::vector<uint8_t> eth;
-          while (!stopping()) {
+          while (tap_run && !stopping()) {
             if (!sta->tap().read(eth, 200)) {
               Sleep(50);
               continue;
@@ -912,7 +941,9 @@ int main(int argc, char **argv) {
             if (!eth.empty() && inbox.size() < 4096) inbox.push({kStaEthernet, eth});
           }
         });
-      }
+        return true;
+      };
+      if (sta) start_station(sta_cfg);
     }
     log_line(std::string("event: channel ") + std::to_string(opt.channel) + " " +
              (radio::channel_active(opt.channel, chan_flags(opt.channel)) ? "active" : "passive"));
@@ -1273,6 +1304,28 @@ int main(int argc, char **argv) {
           } else if (sta) {
             log_line("event: wifi-stall");
             sta->rejoin("the gateway stopped answering");
+          }
+        } else if (req.type == kStaJoinRequest) {
+          if constexpr (caps.supports_station) {
+            std::string path(req.payload.begin(), req.payload.end());
+            StaConfig cfg;
+            std::string err;
+            if (!cfg.load(path, err)) {
+              log_line("station config: " + err);
+              log_line("event: wifi failed");
+            } else {
+              log_line("station: hot join");
+              start_station(cfg);
+            }
+            /* The file holds the Wi-Fi password: gone once read. */
+            DeleteFileA(path.c_str());
+          } else {
+            log_line(radio::station_policy_message(caps));
+          }
+        } else if (req.type == kStaLeaveRequest) {
+          if (sta) {
+            stop_station();
+            log_line("station: left");
           }
         } else if (req.type == kScanRequest) {
           scan_wanted = true;
@@ -1877,10 +1930,8 @@ int main(int argc, char **argv) {
       }
     }
     if (sta) sta->stop();
-    if (tap_thread.joinable()) {
-      g_stop = true;
-      tap_thread.join();
-    }
+    tap_run = false;
+    if (tap_thread.joinable()) tap_thread.join();
     if (!dev.healthy()) log_line("the card stopped answering or the firmware failed");
     dev.stop();
     };

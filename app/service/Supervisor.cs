@@ -272,7 +272,7 @@ public sealed class Supervisor : IDisposable
         }
         Say($"Wi-Fi: use Windows' MAC address: {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         Publish();
     }
 
@@ -301,7 +301,7 @@ public sealed class Supervisor : IDisposable
         }
         Say($"experimental fast passive-channel unlock: {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         Publish();
     }
 
@@ -316,7 +316,7 @@ public sealed class Supervisor : IDisposable
         }
         Say($"experimental coexistence plan: {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         Publish();
     }
 
@@ -331,7 +331,7 @@ public sealed class Supervisor : IDisposable
         }
         Say($"experimental high-throughput mode (HE80 + MTU 1500): {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         Publish();
     }
 
@@ -351,7 +351,10 @@ public sealed class Supervisor : IDisposable
         }
         Say($"experimental data-plane acceleration: {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        {
+            if (!TryHotRejoin())
+                RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
+        }
         Publish();
     }
 
@@ -369,7 +372,10 @@ public sealed class Supervisor : IDisposable
         }
         Say($"experimental Wi-Fi 6 for the station: {(on ? "on" : "off")}");
         if (State is RadioState.On or RadioState.Starting)
-            _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        {
+            if (!TryHotRejoin())
+                RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
+        }
         Publish();
     }
 
@@ -393,7 +399,7 @@ public sealed class Supervisor : IDisposable
         Say(hardwareId == "" ? "card: automatic detection" : $"card: {hardwareId} chosen in settings as {model}");
         if (Card.Find() is { } c) { _profile = c.Profile; _caps = c.Profile.Capabilities; _cardLabel = $"{c.Profile.VendorName} {c.Profile.FamilyName}"; }
         else _cardLabel = "";
-        if (_wanted) _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        if (_wanted) RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         Publish();
         return "";
     }
@@ -480,6 +486,12 @@ public sealed class Supervisor : IDisposable
     /// <summary>One launch at a time: the watchdog, a wake, a mode change and a channel move
     /// used to start radios concurrently and kill each other's (hardware, 2026-11-17).</summary>
     readonly SemaphoreSlim _launchGate = new(1, 1);
+
+    // Settings used to each call Relaunch, so a burst of three experimental
+    // toggles became three 16 s radio restarts, one after another (2026-11-27).
+    readonly object _relaunchSoonLock = new();
+    CancellationTokenSource? _relaunchSoonCts;
+    int _relaunchSoonGen;
 
     void Launch(int channel)
     {
@@ -941,6 +953,31 @@ public sealed class Supervisor : IDisposable
         finally { _launchGate.Release(); }
     }
 
+    /// <summary>Coalesces a burst of settings changes into one relaunch.</summary>
+    void RelaunchSoon(int channel)
+    {
+        CancellationTokenSource cts;
+        int gen;
+        lock (_relaunchSoonLock)
+        {
+            _relaunchSoonCts?.Cancel();
+            cts = _relaunchSoonCts = new CancellationTokenSource();
+            gen = ++_relaunchSoonGen;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(300), cts.Token);
+            }
+            catch (OperationCanceledException) { return; }
+            if (gen != Volatile.Read(ref _relaunchSoonGen)) return;
+            bool wanted;
+            lock (_lock) wanted = _wanted;
+            if (wanted) Relaunch(channel);
+        });
+    }
+
     async Task Watchdog(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -1228,15 +1265,85 @@ public sealed class Supervisor : IDisposable
 
     void RadioCommand(string line)
     {
+        _ = RadioCommandChecked(line);
+    }
+
+    bool RadioCommandChecked(string line)
+    {
         try
         {
             if (_radio is { HasExited: false } r)
             {
                 r.StandardInput.WriteLine(line);
                 r.StandardInput.Flush();
+                return true;
             }
         }
         catch (Exception) { }
+        return false;
+    }
+
+    /// <summary>Whether the running Intel radio can switch its station without a full relaunch.</summary>
+    bool HotWifi() =>
+        State == RadioState.On && _profile.Backend == RadioBackendKind.Iwx &&
+        _radio is { HasExited: false };
+
+    /// <summary>
+    /// Joins a network in the running radio: write the same sta.conf the launch
+    /// path uses, then ask the radio to rebuild only its station context. The
+    /// driver, AWDL and the radio process stay up, so this is the fast path.
+    /// </summary>
+    bool TryHotJoin(Wlan.Network net)
+    {
+        if (!HotWifi()) return false;
+        string path;
+        try
+        {
+            string? staMac;
+            lock (_lock) staMac = _cfg.KeepWindowsMac ? TapMac.FormatColon(_cfg.WindowsMac) : null;
+            path = Wlan.WriteStaConfig(net, _cfg.DataPlaneAccel, _cfg.StationWifi6, staMac);
+        }
+        catch (Exception e)
+        {
+            Say("Wi-Fi: could not prepare the hot-join config: " + e.Message);
+            return false;
+        }
+        lock (_lock)
+        {
+            _wifi = "waiting for a beacon";
+            _wifiError = "";
+        }
+        if (!RadioCommandChecked("join " + path)) return false;
+        Publish();
+        return true;
+    }
+
+    /// <summary>Rejoins the current network in place, if it is connected or still joining.</summary>
+    bool TryHotRejoin()
+    {
+        Wlan.Network? net;
+        lock (_lock)
+        {
+            var busy = _wifi == "connected" ||
+                       _wifi is "waiting for a beacon" or "authenticating" or "associating" or "4-way handshake";
+            if (!busy || _net is null) return false;
+            net = _net;
+        }
+        return TryHotJoin(net);
+    }
+
+    /// <summary>Leaves the station in the running radio; AWDL and the driver stay up.</summary>
+    bool TryHotLeave()
+    {
+        if (!HotWifi()) return false;
+        if (!RadioCommandChecked("leave")) return false;
+        lock (_lock)
+        {
+            _wifi = "";
+            _detail = "";
+        }
+        Publish();
+        return true;
     }
 
     /// <summary>Refreshes the list; `ssid` makes it a directed scan (hidden networks).</summary>
@@ -1263,23 +1370,24 @@ public sealed class Supervisor : IDisposable
         // relaunch below joined nothing and only restarted the radio, which
         // reset discovery each time the user tried again (#11).
         if (EffectiveMode() != NetMode.Concurrent) return "needs concurrent mode";
+        if (State == RadioState.Starting) return "still connecting";
+        lock (_lock)
+        {
+            if (_staSsid == ssid && _wifi == "connected" && string.IsNullOrEmpty(password)) return "";
+            if (_staSsid == ssid &&
+                _wifi is "waiting for a beacon" or "authenticating" or "associating" or "4-way handshake")
+                return "";
+        }
         JsonObject? target;
-        bool stale;
         lock (_lock)
         {
             target = _scan.FirstOrDefault(n => (string?)n["ssid"] == ssid);
-            stale = DateTime.UtcNow - _scanAt > StaleScan;
         }
-        // An iPhone hotspot comes back with a new BSSID: joining the address
-        // from an old scan sent every authentication into the void until a later
-        // scan happened to catch the new one (#27). Look by name again first.
+        // A stale scan's BSSID may be gone (an iPhone hotspot comes back with a
+        // new one, #27). Try the last known address first: a normal reconnect
+        // should not pay for a whole 2.4/5 GHz scan every time. If the radio
+        // reports "wifi failed", OnEvent scans by name and joins what answers.
         var isHidden = hidden || _known.Find(ssid)?.Hidden == true;
-        if (target is not null && stale && !_scanBusy && State == RadioState.On)
-        {
-            lock (_lock) _pendingConnect = (ssid, password, autoConnect);
-            WifiScan(ssid);
-            return "";
-        }
         if (target is null)
         {
             if (_scanBusy)
@@ -1333,7 +1441,11 @@ public sealed class Supervisor : IDisposable
             _staSsid = ssid;
         }
         Say($"Wi-Fi: joining \"{ssid}\" (chosen in nekodrop)");
-        _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        // The running radio can rebuild its station without restarting the card,
+        // AWDL or awdld. Only fall back to the 15-16 s full relaunch if that is
+        // unavailable (another backend, radio already starting/stopped).
+        if (!TryHotJoin(net))
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
         return "";
     }
 
@@ -1349,7 +1461,8 @@ public sealed class Supervisor : IDisposable
         }
         Say("Wi-Fi: disconnected by the user");
         Publish();
-        _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        if (!TryHotLeave())
+            RelaunchSoon(_channel == 0 ? _cfg.StartChannel : _channel);
     }
 
     public void WifiForget(string ssid)
