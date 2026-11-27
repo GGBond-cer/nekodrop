@@ -679,6 +679,37 @@ int main(int argc, char **argv) {
     bool scan_wanted = false, scan_started = false;
     std::vector<uint8_t> scan_ssid;
     uint64_t scan_started_ms = 0;
+    /* What each peer advertises in its 16-entry channel sequence (TLV 18),
+     * logged when it changes. A macOS listener pinned to another channel
+     * advertises its station channel rather than the one it listens on, so a
+     * "device X is not visible" report needs this before anything else. */
+    struct SeqSeen {
+      uint8_t mac[6] = {};
+      uint8_t seq[16] = {};
+      bool used = false;
+    };
+    SeqSeen seq_seen[4];
+    const auto note_sequence = [&](const uint8_t *from, const uint8_t *frame, size_t len) {
+      uint8_t seq[16];
+      if (!awdl::peer_sequence(frame, len, seq)) return;
+      SeqSeen *slot = nullptr;
+      for (auto &s : seq_seen) {
+        if (s.used && std::memcmp(s.mac, from, 6) == 0) { slot = &s; break; }
+        if (!s.used && !slot) slot = &s;
+      }
+      if (!slot) return;
+      if (slot->used && std::memcmp(slot->seq, seq, 16) == 0) return;
+      const bool had = slot->used;
+      slot->used = true;
+      std::memcpy(slot->mac, from, 6);
+      std::memcpy(slot->seq, seq, 16);
+      std::string list;
+      for (unsigned k = 0; k < 16; k++) list += (k ? "," : "") + std::to_string(seq[k]);
+      char b[24];
+      std::snprintf(b, sizeof(b), "%02x:%02x:%02x:%02x:%02x:%02x", from[0], from[1], from[2], from[3],
+                    from[4], from[5]);
+      log_line(std::string("event: peer-sequence ") + b + " " + list + (had ? " (changed)" : ""));
+    };
     dev.set_rx_handler([&](const RxFrame &in) {
       rx_all++;
       /* RxFrame promises no FCS; some firmware appends it anyway. */
@@ -817,6 +848,8 @@ int main(int argc, char **argv) {
           }
         }
         awdl_dbm = f.dbm;
+        /* The sequence itself, not just the peer channel derived from it. */
+        note_sequence(f.data + 10, f.data, f.len);
         uint8_t seq[16];
         if (awdl::peer_sequence(f.data, f.len, seq) && std::memcmp(seq, peer_seq, 16) != 0) {
           std::memcpy(peer_seq, seq, 16);
@@ -864,10 +897,18 @@ int main(int argc, char **argv) {
         }
       }
       if (capture_on) {
-        uint8_t rt[10] = {0, 0, 10, 0};
-        const uint32_t present = (1u << 1) | (1u << 5);
+        /* Radiotap: flags, channel (frequency + flags) and dBm signal, so a
+         * capture says which channel each frame arrived on. flags at 8,
+         * channel at 10 (2-byte aligned), signal at 14. */
+        uint8_t rt[15] = {0, 0, 15, 0};
+        const uint32_t present = (1u << 1) | (1u << 3) | (1u << 5);
         std::memcpy(rt + 4, &present, 4);
-        rt[9] = static_cast<uint8_t>(f.dbm);
+        const uint16_t freq = f.channel <= 14 ? uint16_t(2407 + 5 * f.channel)
+                                              : uint16_t(5000 + 5 * f.channel);
+        std::memcpy(rt + 10, &freq, 2);
+        const uint16_t cflags = f.channel <= 14 ? 0x00a0 : 0x0140; /* CCK+OFDM / 5 GHz OFDM */
+        std::memcpy(rt + 12, &cflags, 2);
+        rt[14] = static_cast<uint8_t>(f.dbm);
         capture.write(rt, sizeof(rt), f.data, f.len);
       }
       if (!client_connected || f.len < 24) return;
