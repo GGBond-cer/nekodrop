@@ -409,6 +409,13 @@ int main(int argc, char **argv) {
   std::thread stdin_thread([&] {
     char line[128];
     while (!stopping() && std::fgets(line, sizeof(line), stdin)) {
+      if (std::strncmp(line, "quit", 4) == 0) {
+        /* Let the device thread run dev.stop(): IwxDevice::stop() resets the
+         * firmware and DMA. Killing the process skips it and can leave the
+         * card in a degraded AWDL state after Windows takes it back. */
+        g_stop = true;
+        break;
+      }
       if (std::strncmp(line, "rejoin", 6) == 0) {
         inbox.push({kRejoinRequest, {}});
         continue;

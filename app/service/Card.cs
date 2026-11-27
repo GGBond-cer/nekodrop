@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -154,6 +155,49 @@ public static class Card
         if (!call.Wait(timeout ?? TimeSpan.FromSeconds(45)))
             return; /* still running; the device state decides */
         if (call.Exception is { } e) throw e.InnerException ?? e;
+    }
+
+    /// <summary>
+    /// Restarts the card through PnP. A user-mode radio that was stopped while
+    /// the card was still in its AWDL/firmware state can leave the Intel
+    /// adapter "up but slow" after Windows takes it back; stopping the radio
+    /// process cannot always reset the hardware (nic_lock can fail). Restarting
+    /// the vendor device makes Windows reload the firmware and DMA from a clean
+    /// state, which is what an uninstall/reboot does.
+    /// </summary>
+    public static bool Restart(string instanceId)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "pnputil.exe"))
+            {
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("/restart-device");
+            psi.ArgumentList.Add(instanceId);
+            using var p = Process.Start(psi);
+            if (p is null) return false;
+            var output = p.StandardOutput.ReadToEndAsync();
+            var errors = p.StandardError.ReadToEndAsync();
+            if (!p.WaitForExit(30000)) { try { p.Kill(); } catch { } return false; }
+            string text = ((output.Wait(1000) ? output.Result : "") + " " +
+                           (errors.Wait(1000) ? errors.Result : "")).Trim();
+            if (p.ExitCode != 0)
+            {
+                // The caller logs the failure; include what pnputil said.
+                throw new InvalidOperationException(
+                    "pnputil /restart-device exited " + p.ExitCode + ": " +
+                    text.Replace("\r", " ").Replace("\n", " "));
+            }
+            return true;
+        }
+        catch (Exception e)
+        {
+            throw new InvalidOperationException("could not restart the Wi-Fi device: " + e.Message, e);
+        }
     }
 
     static string InstanceId(IntPtr set, ref SP_DEVINFO_DATA data)

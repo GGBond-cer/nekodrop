@@ -1505,7 +1505,19 @@ public sealed class Supervisor : IDisposable
         // Ours (running or not), or left with no driver by a failed bind: the vendor's driver goes back on.
         if (card is null || (!Card.BoundToProxy(card) && card.InfPath != ""))
         {
-            if (reconnect) ReconnectWindowsWifi();
+            if (reconnect)
+            {
+                if (card is { InfPath: not "" })
+                {
+                    try
+                    {
+                        Card.Restart(card.InstanceId);
+                        Say($"Wi-Fi: restarted the Wi-Fi device ({Path.GetFileName(card.InfPath)})");
+                    }
+                    catch (Exception e) { Say("Wi-Fi: " + e.Message); }
+                }
+                ReconnectWindowsWifi();
+            }
             return;
         }
         var vendor = card.Profile.VendorName;
@@ -1556,6 +1568,21 @@ public sealed class Supervisor : IDisposable
     void ReconnectWindowsWifi()
     {
         var preferred = _net?.Ssid;
+        if (string.IsNullOrWhiteSpace(preferred))
+        {
+            // Taking the card can make Wlan.Current fail on some adapters even
+            // though Windows was connected a moment ago (the log then says
+            // "cannot read the current connection"). Without a preferred SSID
+            // ConnectDefault picks the first saved auto-connect profile, which
+            // can be an out-of-range network instead of the one the user was
+            // actually using. Fall back to the most recently used saved
+            // network instead, which is what Windows would have chosen.
+            var remembered = _known.All();
+            preferred = remembered.FirstOrDefault(e => e.AutoConnect && !e.Hidden)?.Ssid
+                     ?? remembered.FirstOrDefault(e => e.AutoConnect)?.Ssid;
+            if (!string.IsNullOrEmpty(preferred))
+                Say($"Wi-Fi: no current network read; preferring the last used \"{preferred}\"");
+        }
         if (_userOff)
         {
             Say("Wi-Fi: not reconnecting after AirDrop: Wi-Fi was disconnected in nekodrop");
@@ -1596,7 +1623,11 @@ public sealed class Supervisor : IDisposable
                     // wfsys_reset() BEFORE the process exits and frees its AWE physical pages,
                     // otherwise live WFDMA or stale firmware state can corrupt memory or wedge
                     // the vendor driver on reboot (#54, #72).
-                    if (ReferenceEquals(p, _radio) && _profile.Backend == RadioBackendKind.MtkRadio)
+                    // IwxDevice::stop() similarly resets the Intel firmware and DMA. A hard
+                    // kill skips it and leaves the card in a degraded AWDL state; Windows then
+                    // joins Wi-Fi but transfers at a fraction of the link rate.
+                    if (ReferenceEquals(p, _radio) &&
+                        _profile.Backend is RadioBackendKind.MtkRadio or RadioBackendKind.Iwx)
                     {
                         try
                         {
@@ -1606,7 +1637,7 @@ public sealed class Supervisor : IDisposable
                         }
                         catch (Exception) { }
                         if (p.WaitForExit(6000)) continue;
-                        Say("WARNING: mtkradio did not exit within 6 s after quit; forcing termination");
+                        Say($"WARNING: {_profile.Backend} radio did not exit within 6 s after quit; forcing termination");
                     }
                     p.Kill();
                     p.WaitForExit(5000);
