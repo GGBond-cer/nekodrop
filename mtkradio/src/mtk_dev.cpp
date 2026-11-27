@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include "mtk_dev.h"
+#include "mtk_patch.h"
 #include "mtk_platform.h"
 
 namespace mtk {
@@ -991,36 +992,19 @@ bool MtkDevice::load_patch(const std::string &path, std::string &error) {
     mcu_patch_sem_ctrl(false);
     return false;
   }
-  if (fw.size() < sizeof(MtkPatchHdr)) {
+  mtk_patch_image patch{};
+  if (!mtk_patch_open(fw.data(), fw.size(), &patch)) {
     mcu_patch_sem_ctrl(false);
-    error = "patch image too small";
+    error = "invalid ROM patch section table or payload";
     return false;
   }
-
-  const auto *hdr = reinterpret_cast<const MtkPatchHdr *>(fw.data());
-  const uint32_t n_region = bswap32(hdr->desc.n_region);
-  log("loading ROM patch (" + std::to_string(n_region) + " regions, " +
+  log("loading ROM patch (" + std::to_string(patch.count) + " regions, " +
       std::to_string(fw.size()) + " bytes)");
 
   bool ok = true;
-  for (uint32_t i = 0; i < n_region; i++) {
-    const auto *sec = reinterpret_cast<const MtkPatchSec *>(
-        fw.data() + sizeof(MtkPatchHdr) + i * sizeof(MtkPatchSec));
-    if ((bswap32(sec->type) & PATCH_SEC_TYPE_MASK) != PATCH_SEC_TYPE_INFO) {
-      error = "unsupported patch section type";
-      ok = false;
-      break;
-    }
-    const uint32_t addr = bswap32(sec->addr);
-    const uint32_t len = bswap32(sec->len);
-    const uint32_t offs = bswap32(sec->offs);
-    const uint32_t sec_info = bswap32(sec->sec_key_idx);
-    if (offs + len > fw.size()) {
-      error = "patch section out of bounds";
-      ok = false;
-      break;
-    }
-
+  for (uint32_t i = 0; i < patch.count; ++i) {
+    const auto region = mtk_patch_region_at(&patch, i);
+    const uint32_t sec_info = region.key;
     uint32_t mode = DL_MODE_NEED_RSP;
     if (sec_info != PATCH_SEC_NOT_SUPPORT) {
       const uint32_t enc = field_get(PATCH_SEC_ENC_TYPE_MASK, sec_info);
@@ -1034,12 +1018,12 @@ bool MtkDevice::load_patch(const std::string &path, std::string &error) {
       }
     }
 
-    if (!mcu_init_download(addr, len, mode)) {
+    if (!mcu_init_download(region.address, region.length, mode)) {
       error = "patch init_download failed for region " + std::to_string(i);
       ok = false;
       break;
     }
-    if (!mcu_send_scatter(fw.data() + offs, len, error)) {
+    if (!mcu_send_scatter(fw.data() + region.offset, region.length, error)) {
       ok = false;
       break;
     }

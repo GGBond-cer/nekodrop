@@ -182,6 +182,7 @@ Copy-Item "$repo\third_party\winawdl\awdl\LICENSE" "$stage\licenses\awdld-GPL-3.
 Copy-Item "$repo\third_party\winawdl\airdrop\LICENSE" "$stage\licenses\airdrop-engine-MIT.txt"
 Copy-Item "$repo\LICENSE" "$stage\licenses\nekodrop-GPL-2.0.txt"
 Copy-Item "$mtBuild\firmware\LICENCE.mediatek" "$stage\licenses\mediatek-firmware.txt"
+Copy-Item "$repo\mtkradio\third_party\connac3\LICENSE" "$stage\licenses\mt7925-connac3-BSD-3-Clause-Clear.txt"
 Copy-Item "$repo\mtradio\LICENSE.mt76" "$stage\licenses\mt76-BSD-3-Clause.txt"
 Copy-Item "$repo\third_party\winawdl\deps\wintun\LICENSE.txt" "$stage\licenses\wintun.txt"
 $devourerLicense = @("$repo\third_party\winawdl\upstream\devourer\LICENSE", "$repo\third_party\winawdl\radio\LICENSE") |

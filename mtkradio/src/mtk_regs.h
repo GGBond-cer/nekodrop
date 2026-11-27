@@ -35,10 +35,6 @@ constexpr uint32_t field_get(uint32_t mask, uint32_t val) {
   return (val & mask) >> shift;
 }
 
-inline uint32_t bswap32(uint32_t v) {
-  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
-         ((v & 0x00FF0000u) >> 8) | ((v & 0xFF000000u) >> 24);
-}
 inline uint16_t bswap16(uint16_t v) {
   return static_cast<uint16_t>((v << 8) | (v >> 8));
 }
@@ -504,8 +500,6 @@ constexpr uint32_t FW_FEATURE_OVERRIDE_ADDR = bit(5);
 constexpr uint32_t FW_FEATURE_NON_DL = bit(6);
 
 constexpr uint32_t FW_START_OVERRIDE = bit(0);
-constexpr uint32_t PATCH_SEC_TYPE_MASK = genmask(15, 0);
-constexpr uint32_t PATCH_SEC_TYPE_INFO = 0x2;
 constexpr uint32_t PATCH_SEC_ENC_TYPE_MASK = genmask(31, 24);
 constexpr uint32_t PATCH_SEC_ENC_TYPE_PLAIN = 0x00;
 constexpr uint32_t PATCH_SEC_ENC_TYPE_AES = 0x01;
@@ -604,34 +598,6 @@ struct MtkMcuRxd {
   uint8_t s2d_index;
 };
 static_assert(sizeof(MtkMcuRxd) == 36, "MtkMcuRxd must be 36 bytes");
-
-struct MtkPatchHdr {
-  char build_date[16];
-  char platform[4];
-  uint32_t hw_sw_ver;
-  uint32_t patch_ver;
-  uint16_t checksum;
-  uint16_t rsv;
-  struct {
-    uint32_t patch_ver;
-    uint32_t subsys;
-    uint32_t feature;
-    uint32_t n_region;
-    uint32_t crc;
-    uint32_t rsv[11];
-  } desc;
-};
-
-struct MtkPatchSec {
-  uint32_t type;
-  uint32_t offs;
-  uint32_t size;
-  uint32_t addr;
-  uint32_t len;
-  uint32_t sec_key_idx;
-  uint32_t align_len;
-  uint32_t rsv[9];
-};
 
 struct MtkFwTrailer {
   uint8_t chip_id;
