@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:local="clr-namespace:NekoDrop"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent" ResizeMode="NoResize"
-        ShowInTaskbar="False" Topmost="True" SizeToContent="WidthAndHeight" ShowActivated="True"
+        ShowInTaskbar="False" Topmost="True" SizeToContent="WidthAndHeight" ShowActivated="False"
         Foreground="{DynamicResource Text}" FontFamily="{DynamicResource UiFont}" FontSize="13">
   <Window.Resources>
     <!-- A menu item: a 16 px glyph column and the text; Tag is the glyph -->
