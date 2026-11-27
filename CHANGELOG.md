@@ -6,6 +6,38 @@
 
 ---
 
+## v2.3.9 (Preview / 预览版)
+
+### 中文
+
+- **修复 Windows 内置原厂驱动（如 `C:\Windows\INF\netwtw10.inf`）在还卡时被误拒、导致退出或 TKIP 降级后断网（[#116](https://github.com/zheznanohana/nekodrop/issues/116)）**：
+  - 此前 `EnsureVendorDriver()` 的文件名校验只允许 `oemNN.inf`，会把 Windows 自带的内置无线驱动（`netwtw10.inf` / `netwtw14.inf` 等）当成不受信任路径拒绝绑定。现改为允许 `%SystemRoot%\INF` 下的安全标准 `.inf` 文件名（仍严格禁止目录穿越、符号链接与 nekodrop 自身代理 INF）。
+- **新增「按需模式空闲超时时长」自定义（[#96](https://github.com/zheznanohana/nekodrop/issues/96)）**：
+  - 在 *设置 → 网络与接收* 新增 `15s / 30s / 60s / 90s` 分段选择（默认仍为 `90s`），方便按需模式用户防止误触隔空投送菜单后长时间断网。
+- **合并 6 个稳定性与安全加固 PR（感谢 [@Futaoj](https://github.com/Futaoj)）**：
+  - **PR #113（防 DMA 释放顺序竞态与蓝屏风险）**：在 `iwxradio` 与 `mtkradio` 中调整成员析构顺序，确保先关闭 `RegProxy`（触发 UMDF 紧急停 DMA）再释放物理 DMA 页；并为 `MtkDevice::rx_ring_pop()` 增加环长上界防止异常描述符死循环。
+  - **PR #114（服务停止与启动竞态加固）**：`Supervisor.Dispose()` 统一经由 `Stop()` 串行收尾，服务停止期间取消在途 radio 启动，避免竞态残留 `awdld.exe`。
+  - **PR #112（修复静默自动更新重启旧版客户端）**：把静默更新后的客户端启动移至 `CurStepChanged(ssPostInstall)` 中 `install.ps1` 成功拷贝新文件之后执行。
+  - **PR #111（`awdld` OWL RX A-MSDU 栈边界与内存安全加固）**：将未做边界检查的 16 项栈数组升级为带上下界校验的 512 项 `struct awdl_rx_frames`，精确分配以太网帧缓冲、补齐 `malloc` 空指针检查与局部失败时的无条件释放。
+  - **PR #110（mDNS IPv6 单播跳数 255 与突发查询保护）**：按 RFC 6762 §11 设置 `IPV6_UNICAST_HOPS = 255`，并用 64 项独立缓存把单播 QU 回复从全局组播限流解耦。
+  - **PR #106（MediaTek 固件 ROM Patch 分段预校验）**：在向 MCU 下载前完整校验描述符表与每段偏移边界（含 `mtk_patch_test` 单测）。
+
+### English
+
+- **Fix Windows in-box Wi-Fi drivers (e.g. `C:\Windows\INF\netwtw10.inf`) being rejected on card give-back ([#116](https://github.com/zheznanohana/nekodrop/issues/116)):**
+  - `EnsureVendorDriver()` previously required `^oem\d+\.inf$`, rejecting built-in Windows drivers like `netwtw10.inf` / `netwtw14.inf` when returning the card on stop or TKIP fallback. Now accepts standard `.inf` basenames directly inside `%SystemRoot%\INF` while retaining path-containment, reparse-point, and proxy-INF checks.
+- **Add configurable On-Demand idle timeout ([#96](https://github.com/zheznanohana/nekodrop/issues/96)):**
+  - Added a `15s / 30s / 60s / 90s` selector (default `90s`) under *Settings → Network and receiving* so accidental AirDrop wake-ups do not hold the Wi-Fi card for 90 s.
+- **Merged 6 stability and safety hardening PRs (thanks [@Futaoj](https://github.com/Futaoj)):**
+  - **PR #113:** Close `RegProxy` (emergency DMA stop) before freeing `_dma` pools in both `iwxradio` and `mtkradio`, and bound `MtkDevice::rx_ring_pop()` scan loops.
+  - **PR #114:** Serialize `Supervisor.Dispose()` through `Stop()` and abort in-flight launches cleanly when stopping.
+  - **PR #112:** Launch silent auto-updates inside `CurStepChanged(ssPostInstall)` after `install.ps1` finishes copying new binaries.
+  - **PR #111:** Guard `awdld` OWL RX A-MSDU output with a 512-entry bounded `struct awdl_rx_frames`, exact Ethernet allocations, `malloc` NULL checks, and unconditional cleanup on partial decode failure.
+  - **PR #110:** Set `IPV6_UNICAST_HOPS = 255` (RFC 6762 §11) and decouple QU unicast mDNS replies from global multicast throttling with a bounded 64-entry cache.
+  - **PR #106:** Validate MediaTek ROM patch section tables and bounds before MCU download (`mtk_patch.h` + `mtk_patch_test`).
+
+---
+
 ## v2.3.8 (Preview / 预览版)
 
 ### 中文

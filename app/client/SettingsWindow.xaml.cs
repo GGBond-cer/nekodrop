@@ -69,6 +69,8 @@ public partial class SettingsWindow : Window
         StationWifi6Box.IsChecked = (bool?)A.Service.Last?["stationWifi6"] ?? false;
         KeepMacBox.IsChecked = (bool?)A.Service.Last?["keepWindowsMac"] ?? true;
         QuickReleaseBox.IsChecked = (bool?)A.Service.Last?["quickReleaseOnDemand"] ?? false;
+        var idleSec = (int?)A.Service.Last?["idleSeconds"] ?? 90;
+        (idleSec <= 15 ? Idle15 : idleSec <= 30 ? Idle30 : idleSec <= 60 ? Idle60 : Idle90).IsChecked = true;
         CheckUpdatesBox.IsChecked = s.CheckUpdates;
         PreviewUpdatesBox.IsChecked = s.PreviewUpdates;
         DeleteInstallerBox.IsChecked = s.DeleteInstallerAfterInstall;
@@ -382,6 +384,8 @@ public partial class SettingsWindow : Window
         if (keepMac != ((bool?)A.Service.Last?["keepWindowsMac"] ?? true)) A.Service.SetKeepWindowsMac(keepMac);
         var quickRelease = QuickReleaseBox.IsChecked == true;
         if (quickRelease != ((bool?)A.Service.Last?["quickReleaseOnDemand"] ?? false)) A.Service.SetQuickReleaseOnDemand(quickRelease);
+        var idleSec = Idle15.IsChecked == true ? 15 : Idle30.IsChecked == true ? 30 : Idle60.IsChecked == true ? 60 : 90;
+        if (idleSec != ((int?)A.Service.Last?["idleSeconds"] ?? 90)) A.Service.SetIdleSeconds(idleSec);
         var stationWifi6 = StationWifi6Box.IsChecked == true;
         if (stationWifi6 != ((bool?)A.Service.Last?["stationWifi6"] ?? false)) A.Service.SetStationWifi6(stationWifi6);
         A.Window?.FolderChanged();

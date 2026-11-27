@@ -77,6 +77,9 @@ public sealed class ControlPipe(Supervisor sup)
                     case "station-wifi6": sup.SetStationWifi6((bool?)cmd?["on"] ?? false); break;
                     case "keep-windows-mac": sup.SetKeepWindowsMac((bool?)cmd?["on"] ?? true); break;
                     case "quick-release-ondemand": sup.SetQuickReleaseOnDemand((bool?)cmd?["on"] ?? false); break;
+                    case "idle-seconds":
+                        if ((int?)cmd?["seconds"] is { } secs) sup.SetIdleSeconds(secs);
+                        break;
                     case "cards":
                     {
                         // For the manual choice: the PCI network controllers and the models a card can be run as.

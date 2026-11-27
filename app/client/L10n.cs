@@ -460,6 +460,8 @@ public static class L
         ["set.keepMac.short"] = ("路由器看到的还是这台电脑原来的网卡地址，DHCP 固定 IP、MAC 过滤、设备名等设置照常生效。关闭后改用 nekodrop 虚拟网卡自己的地址。", "The router keeps seeing this PC's own Wi-Fi address, so DHCP reservations, MAC filters and device names still apply. Off: the nekodrop adapter's own address."),
         ["set.quickRelease"] = ("按需模式传完文件后立即归还网卡", "Release Wi-Fi card right after transfer (On demand)"),
         ["set.quickRelease.short"] = ("仅对按需模式生效：收发完成后约 5 秒即归还网卡给 Windows（并在 15 秒内忽略旁边设备的被动蓝牙唤醒），不用等默认 90 秒空闲超时。", "On-demand mode only: returns the card to Windows ~5 s after a transfer finishes (ignoring passive BLE wake-ups for 15 s) instead of waiting the default 90 s idle timeout."),
+        ["set.idleTimeout"] = ("按需模式空闲超时时长", "On-demand idle timeout"),
+        ["set.idleTimeout.short"] = ("按需模式被唤醒后若没有传输，等待多久自动把网卡还给 Windows（防止误触隔空投送菜单导致长时间断网）。", "How long on-demand mode waits without a transfer before returning the Wi-Fi card to Windows (prevents accidental AirDrop wake-ups from holding the card too long)."),
         ["wifi.fallback"] = ("已改用按需：{0}", "Running on demand: {0}"),
         ["wifi.unsupported.tkipGroup"] = ("当前 Wi-Fi 是 WPA/WPA2 混合加密（广播用 TKIP），同时连 Wi-Fi 暂不支持", "This Wi-Fi is WPA/WPA2 mixed (TKIP for broadcasts), which Concurrent mode does not support yet"),
         ["wifi.unsupported.tkip"] = ("当前 Wi-Fi 只用 TKIP 加密，同时连 Wi-Fi 不支持", "This Wi-Fi uses TKIP only, which Concurrent mode does not support"),

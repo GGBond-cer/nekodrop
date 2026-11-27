@@ -105,6 +105,7 @@ public sealed class Supervisor : IDisposable
                 ["stationWifi6"] = _cfg.StationWifi6,
                 ["keepWindowsMac"] = _cfg.KeepWindowsMac,
                 ["quickReleaseOnDemand"] = _cfg.QuickReleaseOnDemand,
+                ["idleSeconds"] = _cfg.IdleSeconds,
                 ["card"] = _cardLabel,
                 ["manualCard"] = _cfg.ManualCard,
                 ["manualModel"] = _cfg.ManualModel,
@@ -287,6 +288,20 @@ public sealed class Supervisor : IDisposable
             if (!on) _quickReleaseAt = DateTime.MinValue;
         }
         Say($"on-demand quick release after transfer: {(on ? "on" : "off")}");
+        Publish();
+    }
+
+    /// <summary>Seconds without AirDrop activity before on-demand mode gives the card back (#96).</summary>
+    public void SetIdleSeconds(int seconds)
+    {
+        seconds = Math.Clamp(seconds, 15, 600);
+        lock (_lock)
+        {
+            if (_cfg.IdleSeconds == seconds) return;
+            _cfg.IdleSeconds = seconds;
+            _cfg.Save();
+        }
+        Say($"on-demand idle timeout: {seconds} s");
         Publish();
     }
 
@@ -1492,7 +1507,8 @@ public sealed class Supervisor : IDisposable
         var infRoot = infDir.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         if (!fullInf.StartsWith(infRoot, StringComparison.OrdinalIgnoreCase) ||
             !string.Equals(Path.GetDirectoryName(fullInf), infDir.TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase) ||
-            !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(fullInf), @"^oem\d+\.inf$", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ||
+            !System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(fullInf), @"^[a-z0-9][a-z0-9._-]*\.inf$", System.Text.RegularExpressions.RegexOptions.IgnoreCase) ||
+            Path.GetFileName(fullInf).Contains("..", StringComparison.Ordinal) ||
             (File.GetAttributes(fullInf) & FileAttributes.ReparsePoint) != 0)
         {
             Say($"refusing untrusted VendorInf path: {_cfg.VendorInf}");

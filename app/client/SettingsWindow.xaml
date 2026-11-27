@@ -165,6 +165,21 @@
                   <TextBlock Text="{local:T set.quickRelease.short}" Style="{StaticResource Sub12}" Margin="0,2,0,0" TextWrapping="Wrap"/>
                 </StackPanel>
               </DockPanel>
+              <Border Style="{StaticResource Rule}" Margin="0,12"/>
+              <DockPanel>
+                <Border DockPanel.Dock="Right" Style="{StaticResource SegmentBox}" VerticalAlignment="Center" Margin="12,0,0,0">
+                  <StackPanel Orientation="Horizontal">
+                    <RadioButton x:Name="Idle15" Style="{StaticResource Segment}" Content="15s" GroupName="idlesec"/>
+                    <RadioButton x:Name="Idle30" Style="{StaticResource Segment}" Content="30s" GroupName="idlesec"/>
+                    <RadioButton x:Name="Idle60" Style="{StaticResource Segment}" Content="60s" GroupName="idlesec"/>
+                    <RadioButton x:Name="Idle90" Style="{StaticResource Segment}" Content="90s" GroupName="idlesec"/>
+                  </StackPanel>
+                </Border>
+                <StackPanel>
+                  <TextBlock Text="{local:T set.idleTimeout}" FontSize="13" FontWeight="Medium" TextWrapping="Wrap"/>
+                  <TextBlock Text="{local:T set.idleTimeout.short}" Style="{StaticResource Sub12}" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+              </DockPanel>
             </StackPanel>
           </Border>
           <Border Style="{StaticResource CardPad}">
