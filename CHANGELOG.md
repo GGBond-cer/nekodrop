@@ -6,6 +6,37 @@
 
 ---
 
+## v2.3.10 (Preview / 预览版)
+
+### 中文
+
+- **修复开启「互传联盟（MTA）」时 AirDrop 双向传输变慢（BT-Coex 共存抢占）**：
+  - 在 Intel AX201 等 Wi-Fi / 蓝牙共用射频网卡上，互传联盟持续运行的 BLE 主动扫描（`Active`）与外设广播会在 AirDrop 传大文件期间抢占 BT-Coex 时间片（AX201 实测发送从 ~50 MiB/s 降至 43–45 MiB/s、接收降至 35 MiB/s）。
+  - 现改为在 AirDrop 收发期间自动暂停互传联盟 BLE 扫描与外设广播（保留已发现设备且不打断进行中的安卓接收或 AirDrop→MTA 中继），传输结束立即恢复。
+- **彻底修复关闭/还卡后 Windows Wi-Fi 假连接、弹窗重输密码或降速（PR #119，感谢 [@GGBond-cer](https://github.com/GGBond-cer)）**：
+  - 还卡前并发释放 `nekodrop` TAP 虚拟网卡残留的 IPv4 地址与默认路由，避免 Windows Wi-Fi 回退到 169.254 APIPA 假连接。
+  - 通过标准输入发送 `quit` 让 Intel radio 优雅执行 `IwxDevice::stop()`（停止 DMA 并复位固件），避免强杀进程把网卡留在降速状态。
+  - 修复 `WlanConnect` 在 Windows 正在关联时重复触发导致的断连竞态，并在快速路径未连通 IPv4 时自动执行带会话代次保护的 PnP 设备重启兜底。
+- **修复折叠托盘内右键菜单悬停导致托盘自动收起（PR #124，感谢 [@FaithAluten](https://github.com/FaithAluten)）**：
+  - 菜单从 Windows 11/10 折叠托盘打开时启用 `WS_EX_NOACTIVATE` 并监视折叠托盘可见性，悬停「联网方式」等菜单项不再抢占焦点导致托盘消失。
+- **增强 AWDL 诊断日志与抓包信道元数据（PR #120，感谢 [@sh17632](https://github.com/sh17632)）**：
+  - 记录每个对端 TLV 18 信道序列变更（`event: peer-sequence`），并为可选 pcap 抓包的 Radiotap 头补充频率与信道标志字段。
+
+### English
+
+- **Fix AirDrop bidirectional throughput drop when Android MTA is enabled (BT-Coex contention):**
+  - On combo Wi-Fi+BT adapters (e.g. Intel AX201), MTA's continuous BLE Active scanner and peripheral advertising contended with AWDL for BT-Coex airtime during large AirDrop transfers (measured drop from ~50 MiB/s to 43–45 MiB/s TX and ~35 MiB/s RX on AX201).
+  - `MtaEngine` now automatically yields BLE active scanning and idle peripheral advertising while an AirDrop transfer is active (preserving discovered MTA peers and leaving active MTA receives / AirDrop→MTA relays untouched), resuming immediately after the transfer finishes.
+- **Fix Windows Wi-Fi hand-back getting stuck without Internet, prompting for password, or running degraded (PR #119, thanks [@GGBond-cer](https://github.com/GGBond-cer)):**
+  - Releases stale IPv4 addresses and default routes from the `nekodrop` TAP adapter concurrently with driver hand-back so Windows Wi-Fi acquires a real DHCP lease instead of APIPA.
+  - Sends `quit` to `iwxradio` so `IwxDevice::stop()` cleanly halts DMA and resets firmware instead of hard-killing the radio.
+  - Avoids cancelling in-progress Windows associations with redundant `WlanConnect` calls, verifies usable IPv4 connectivity, and falls back to an epoch-guarded PnP device restart when needed.
+- **Fix Windows tray overflow flyout closing when hovering the context menu (PR #124, thanks [@FaithAluten](https://github.com/FaithAluten)):**
+  - Uses `WS_EX_NOACTIVATE` only when opened from the Win11/Win10 overflow flyout and tracks flyout visibility so hovering menu items no longer steals focus and dismisses the tray.
+- **Log peer AWDL TLV 18 channel sequences and include channel frequency in Radiotap captures (PR #120, thanks [@sh17632](https://github.com/sh17632)).**
+
+---
+
 ## v2.3.9 (Preview / 预览版)
 
 ### 中文
