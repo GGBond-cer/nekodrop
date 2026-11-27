@@ -1514,7 +1514,7 @@ private:
     if (len < 24 || !_pipe.connected()) return;
     if (_bssid_set && std::memcmp(data + 16, _bssid.data(), 6) != 0) return;
     /* Split QoS Data A-MSDUs (QoS Control bit 7 = 0x80) into standard MPDUs for awdld. */
-    if (len >= 26 && (data[0] & 0x8cu) == 0x88u) {
+    if (_dev.is_mt7925() && len >= 26 && (data[0] & 0x8cu) == 0x88u) {
       const uint16_t fc = fc_of(data);
       const size_t qos_off = ((fc & 0x0300u) == 0x0300u) ? 30u : 24u;
       const size_t hdr_len = qos_off + 2u + ((fc & 0x8000u) ? 4u : 0u);
@@ -1535,7 +1535,7 @@ private:
           std::memcpy(_amsdu_mpdu.data(), data, hdr_len);
           _amsdu_mpdu[qos_off] &= static_cast<uint8_t>(~0x80u);
           std::memcpy(_amsdu_mpdu.data() + hdr_len, sub_ptr, clean_len);
-          if (_dev.is_mt7925() && _tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
+          if (_tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
             purge_acked_retries();
           queue_one_rx_mpdu(_amsdu_mpdu.data(), _amsdu_mpdu.size(), dbm);
           emitted++;
@@ -1550,7 +1550,7 @@ private:
           _amsdu_mpdu.resize(hdr_len + inner_len);
           std::memcpy(_amsdu_mpdu.data(), data, hdr_len);
           std::memcpy(_amsdu_mpdu.data() + hdr_len, data + hdr_len + skip, inner_len);
-          if (_dev.is_mt7925() && _tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
+          if (_tcp_acks.note_peer_rx(_amsdu_mpdu.data(), _amsdu_mpdu.size()))
             purge_acked_retries();
           queue_one_rx_mpdu(_amsdu_mpdu.data(), _amsdu_mpdu.size(), dbm);
           return;
@@ -2665,7 +2665,7 @@ int main(int argc, char **argv) {
   else if (opt->test_switch) rc = test_switch(dev, opt->test_switch);
   else if (opt->test_scan) rc = test_scan(dev);
   else {
-    PipeServer pipe(RADIO_LINK_PIPE_NAME, [] { return g_stop.load(); });
+    PipeServer pipe(RADIO_LINK_PIPE_NAME, [] { return g_stop.load(); }, dev.is_mt7925());
     if (!pipe.valid()) {
       say("bring-up failed: cannot create %s (%lu): already running?", RADIO_LINK_PIPE_NAME, GetLastError());
       dev.close();
@@ -2681,7 +2681,7 @@ int main(int argc, char **argv) {
     }
     std::thread reader([&] {
       while (!g_stop && pipe.wait_for_client()) {
-        const uint8_t shm_flag = opt->mt7925 ? pipe.shm_cap_flag() : 0;
+        const uint8_t shm_flag = pipe.shm_cap_flag();
         radio_link_hello hello{RADIO_LINK_VERSION, relay.channel, relay.width, {shm_flag, 0}};
         pipe.send(RADIO_LINK_HELLO, {reinterpret_cast<const uint8_t *>(&hello), sizeof(hello)});
         say("client connected (shm=%u)", static_cast<unsigned>(shm_flag));
