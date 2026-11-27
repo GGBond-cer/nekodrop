@@ -140,12 +140,18 @@ constexpr uint8_t kWcidGlobal = 0; /* mt792x_init_wcid: management frames */
 constexpr uint8_t kOmacIdx = 0; /* AWDL: own MAC 0, BSS 0 */
 
 /* The 20/40/80 MHz block a 5 GHz channel belongs to. */
-uint8_t center_channel(uint8_t ch, uint8_t width) {
+constexpr uint8_t center_channel(uint8_t ch, uint8_t width, bool mt7925 = false) {
   if (ch <= 14 || width == 20) return ch;
-  if (width == 40) return static_cast<uint8_t>(((ch - 36) / 8) * 8 + 38);
+  if (width == 40) {
+    const int first = mt7925 && ch >= 149 ? 149 : 36;
+    return static_cast<uint8_t>(((ch - first) / 8) * 8 + first + 2);
+  }
   if (ch >= 149) return static_cast<uint8_t>(((ch - 149) / 16) * 16 + 155);
   return static_cast<uint8_t>(((ch - 36) / 16) * 16 + 42);
 }
+
+static_assert(center_channel(149, 40, true) == 151 && center_channel(153, 40, true) == 151);
+static_assert(center_channel(157, 40, true) == 159 && center_channel(161, 40, true) == 159);
 
 uint8_t cbw(uint8_t width) { return width == 80 ? 2 : width == 40 ? 1 : 0; }
 
@@ -244,7 +250,7 @@ bool Mt7902::sniffer_config(bool wait) {
   req.ch_band = _channel > 14 ? 2 : 1;
   req.bw = eff_w == 80 ? 1 : 0;
   req.control_ch = _channel;
-  req.center_ch = center_channel(_channel, eff_w);
+  req.center_ch = center_channel(_channel, eff_w, is_mt7925());
   req.sco = req.control_ch < req.center_ch ? 1 : req.control_ch > req.center_ch ? 3 : 0;
   req.drop_err = 1;
   if (is_mt7925()) {

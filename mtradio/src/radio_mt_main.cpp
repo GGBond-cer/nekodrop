@@ -498,6 +498,7 @@ public:
     auto last_report = Clock::now(), last_peer_maint = last_report;
     unsigned idle = 0;
     std::deque<ClientMsg> ctrl, data, local;
+    const bool mt7925 = _dev.is_mt7925();
     while (!g_stop) {
       {
         std::lock_guard<std::mutex> lock(_mutex);
@@ -508,18 +509,19 @@ public:
           clear_retry_frames();
           _client_reset = false;
         }
-        while (!_queue.empty()) {
-          ClientMsg m = std::move(_queue.front());
-          _queue.pop_front();
+        // MT7902 leaves excess work in the input queue for the next round.
+        while (!_queue.empty() && (mt7925 || ctrl.size() + data.size() + local.size() < 1024)) {
+          ClientMsg &m = _queue.front();
           if (m.type != RADIO_LINK_TX) {
             local.push_back(std::move(m));
           } else if (is_unicast_data(m)) {
-            if (data.size() < kMaxDataLane) data.push_back(std::move(m));
+            if (!mt7925 || data.size() < kMaxDataLane) data.push_back(std::move(m));
             else ++_tx_refused;
           } else {
-            if (ctrl.size() >= kMaxCtrlLane) ctrl.pop_front();
+            if (mt7925 && ctrl.size() >= kMaxCtrlLane) ctrl.pop_front();
             ctrl.push_back(std::move(m));
           }
+          _queue.pop_front();
         }
       }
       unsigned did = 0;
