@@ -42,8 +42,10 @@
       <Style.Triggers>
         <DataTrigger Binding="{Binding State}" Value="asking"><Setter Property="Foreground" Value="{DynamicResource Accent}"/></DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="sending"><Setter Property="Foreground" Value="{DynamicResource Accent}"/></DataTrigger>
+        <DataTrigger Binding="{Binding State}" Value="finishing"><Setter Property="Foreground" Value="{DynamicResource Accent}"/></DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="sent"><Setter Property="Foreground" Value="{DynamicResource Success}"/></DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="declined"><Setter Property="Foreground" Value="{DynamicResource Declined}"/></DataTrigger>
+        <DataTrigger Binding="{Binding State}" Value="cancelled"><Setter Property="Foreground" Value="{DynamicResource Text3}"/></DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="failed"><Setter Property="Foreground" Value="{DynamicResource FailedText}"/></DataTrigger>
       </Style.Triggers>
     </Style>
@@ -77,6 +79,7 @@
       <Setter Property="Thickness" Value="3"/>
       <Style.Triggers>
         <DataTrigger Binding="{Binding State}" Value="sending"><Setter Property="Visibility" Value="Visible"/></DataTrigger>
+        <DataTrigger Binding="{Binding State}" Value="finishing"><Setter Property="Visibility" Value="Visible"/></DataTrigger>
       </Style.Triggers>
     </Style>
     <Style x:Key="OutcomeRing" TargetType="Ellipse">
@@ -340,12 +343,26 @@
           <Setter TargetName="status" Property="Text" Value="{Binding Ask.Status}"/>
           <Setter TargetName="status" Property="Foreground" Value="{DynamicResource Accent}"/>
         </DataTrigger>
+        <!-- Armed cancel (1st click during transfer): red X + prompt; 2nd click cancels, outside/Esc/3s disarms -->
+        <DataTrigger Binding="{Binding ConfirmCancel}" Value="True">
+          <Setter TargetName="Disc" Property="Fill" Value="{DynamicResource ErrorBg}"/>
+          <Setter TargetName="Disc" Property="Stroke" Value="{DynamicResource Error}"/>
+          <Setter TargetName="Disc" Property="StrokeThickness" Value="2"/>
+          <Setter TargetName="sendRing" Property="Stroke" Value="{DynamicResource Error}"/>
+          <Setter TargetName="nodeGlyph" Property="Text" Value="&#xE711;"/>
+          <Setter TargetName="nodeGlyph" Property="Foreground" Value="{DynamicResource Error}"/>
+          <Setter TargetName="status" Property="Visibility" Value="Visible"/>
+          <Setter TargetName="status" Property="Text" Value="{local:T transfer.confirmCancel}"/>
+          <Setter TargetName="status" Property="Foreground" Value="{DynamicResource Error}"/>
+          <Setter TargetName="status" Property="FontWeight" Value="SemiBold"/>
+        </DataTrigger>
       </DataTemplate.Triggers>
     </DataTemplate>
 
     <!-- The same device as a row of the list -->
     <DataTemplate x:Key="ListRow" DataType="local:Device">
       <Border x:Name="row" Style="{StaticResource WinCard}" Padding="12,10" Margin="0,0,0,8" AllowDrop="True" Tag="{Binding}"
+              MouseLeftButtonUp="ListRow_Click"
               DragEnter="Node_DragEnter" DragOver="Node_DragOver" DragLeave="Node_DragLeave" Drop="Node_Drop">
         <DockPanel>
           <Grid DockPanel.Dock="Right" VerticalAlignment="Center" Margin="12,0,0,0">
@@ -367,8 +384,8 @@
             </StackPanel>
           </Grid>
           <Grid DockPanel.Dock="Left" Width="36" Height="36" Margin="0,0,12,0">
-            <Ellipse Fill="{DynamicResource AccentSubtle}"/>
-            <TextBlock FontFamily="{DynamicResource IconFont}" Text="{Binding Glyph}" FontSize="15" Foreground="{DynamicResource Accent}"
+            <Ellipse x:Name="listDisc" Fill="{DynamicResource AccentSubtle}"/>
+            <TextBlock x:Name="listGlyph" FontFamily="{DynamicResource IconFont}" Text="{Binding Glyph}" FontSize="15" Foreground="{DynamicResource Accent}"
                        HorizontalAlignment="Center" VerticalAlignment="Center"/>
           </Grid>
           <StackPanel VerticalAlignment="Center">
@@ -384,9 +401,15 @@
         </Trigger>
         <DataTrigger Binding="{Binding State}" Value="asking">
           <Setter TargetName="send" Property="Visibility" Value="Collapsed"/><Setter TargetName="waiting" Property="Visibility" Value="Visible"/>
+          <Setter TargetName="row" Property="Cursor" Value="Hand"/>
         </DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="sending">
           <Setter TargetName="send" Property="Visibility" Value="Collapsed"/><Setter TargetName="bar" Property="Visibility" Value="Visible"/>
+          <Setter TargetName="row" Property="Cursor" Value="Hand"/>
+        </DataTrigger>
+        <DataTrigger Binding="{Binding State}" Value="finishing">
+          <Setter TargetName="send" Property="Visibility" Value="Collapsed"/><Setter TargetName="bar" Property="Visibility" Value="Visible"/>
+          <Setter TargetName="row" Property="Cursor" Value="Hand"/>
         </DataTrigger>
         <DataTrigger Binding="{Binding State}" Value="sent">
           <Setter TargetName="send" Property="Visibility" Value="Collapsed"/><Setter TargetName="done" Property="Visibility" Value="Visible"/>
@@ -400,6 +423,18 @@
           <Setter TargetName="answer" Property="Visibility" Value="Collapsed"/><Setter TargetName="inbar" Property="Visibility" Value="Visible"/>
           <Setter TargetName="listStatus" Property="Text" Value="{Binding Ask.Status}"/>
           <Setter TargetName="listStatus" Property="Foreground" Value="{DynamicResource Accent}"/>
+          <Setter TargetName="row" Property="Cursor" Value="Hand"/>
+        </DataTrigger>
+        <DataTrigger Binding="{Binding ConfirmCancel}" Value="True">
+          <Setter TargetName="row" Property="BorderBrush" Value="{DynamicResource Error}"/>
+          <Setter TargetName="row" Property="Background" Value="{DynamicResource ErrorBg}"/>
+          <Setter TargetName="listDisc" Property="Fill" Value="{DynamicResource Error}"/>
+          <Setter TargetName="listGlyph" Property="Text" Value="&#xE711;"/>
+          <Setter TargetName="listGlyph" Property="Foreground" Value="White"/>
+          <Setter TargetName="listStatus" Property="Text" Value="{local:T transfer.confirmCancel}"/>
+          <Setter TargetName="listStatus" Property="Foreground" Value="{DynamicResource Error}"/>
+          <Setter TargetName="listStatus" Property="FontWeight" Value="SemiBold"/>
+          <Setter TargetName="row" Property="Cursor" Value="Hand"/>
         </DataTrigger>
       </DataTemplate.Triggers>
     </DataTemplate>

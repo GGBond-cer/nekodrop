@@ -3,6 +3,7 @@ using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Shapes;
@@ -40,10 +41,14 @@ public partial class RadarView : UserControl
     // A soft light behind the hub that breathes while AirDrop listens.
     readonly Ellipse _halo = new() { RenderTransformOrigin = new Point(0.5, 0.5), RenderTransform = new ScaleTransform(1, 1), Opacity = 0 };
     bool _rippling, _breathing, _hintShown;
+    Device? _armed;
+    Window? _host;
+    readonly System.Windows.Threading.DispatcherTimer _armTimer = new() { Interval = TimeSpan.FromSeconds(3) };
 
     public RadarView()
     {
         InitializeComponent();
+        _armTimer.Tick += (_, _) => DisarmCancel();
         foreach (var r in _ripples) Rings.Children.Add(r);
         Rings.Children.Add(_halo);
         Rings.Children.Add(_orbit);
@@ -62,6 +67,13 @@ public partial class RadarView : UserControl
             A.Model.PropertyChanged += OnModel;
             A.Model.Requests.CollectionChanged += OnRequests;
             A.Model.Stored += OnStored;
+            _host = Window.GetWindow(this);
+            if (_host is not null)
+            {
+                _host.PreviewMouseLeftButtonDown += OnHostPreviewMouseLeftButtonDown;
+                _host.PreviewMouseRightButtonDown += OnHostPreviewMouseRightButtonDown;
+                _host.PreviewKeyDown += OnHostPreviewKeyDown;
+            }
             Update();
             OnRequests(null, null);
         };
@@ -71,13 +83,21 @@ public partial class RadarView : UserControl
             A.Model.PropertyChanged -= OnModel;
             A.Model.Requests.CollectionChanged -= OnRequests;
             A.Model.Stored -= OnStored;
+            if (_host is not null)
+            {
+                _host.PreviewMouseLeftButtonDown -= OnHostPreviewMouseLeftButtonDown;
+                _host.PreviewMouseRightButtonDown -= OnHostPreviewMouseRightButtonDown;
+                _host.PreviewKeyDown -= OnHostPreviewKeyDown;
+                _host = null;
+            }
+            DisarmCancel();
             foreach (var r in _watched) r.PropertyChanged -= OnRequest;
             _watched.Clear();
             Ripple(false);
             Breathe(false);
             Spin(false);
         };
-        IsVisibleChanged += (_, _) => Update();
+        IsVisibleChanged += (_, _) => { if (!IsVisible) DisarmCancel(); Update(); };
     }
 
     /// <summary>The send window's smaller heading.</summary>
@@ -390,9 +410,75 @@ public partial class RadarView : UserControl
 
     // ---------------------------------------------------------------- sending
 
+    void ArmCancel(Device d)
+    {
+        if (_armed is not null && !ReferenceEquals(_armed, d)) _armed.ConfirmCancel = false;
+        _armed = d;
+        d.ConfirmCancel = true;
+        _armTimer.Stop();
+        _armTimer.Start();
+    }
+
+    void DisarmCancel()
+    {
+        _armTimer.Stop();
+        if (_armed is null) return;
+        _armed.ConfirmCancel = false;
+        _armed = null;
+    }
+
+    bool HandleTransferCancelClick(Device d)
+    {
+        if (!d.CanCancel) return false;
+        if (d.ConfirmCancel)
+        {
+            DisarmCancel();
+            A.CancelTransfer(d);
+        }
+        else
+        {
+            ArmCancel(d);
+        }
+        return true;
+    }
+
+    void OnHostPreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_armed is null) return;
+        for (var cur = e.OriginalSource as DependencyObject; cur is not null;
+             cur = cur is Visual or System.Windows.Media.Media3D.Visual3D ? VisualTreeHelper.GetParent(cur) : LogicalTreeHelper.GetParent(cur))
+            if (cur is FrameworkElement fe && ReferenceEquals(fe.Tag, _armed))
+                return;
+        DisarmCancel();
+    }
+
+    void OnHostPreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (_armed is null) return;
+        DisarmCancel();
+        e.Handled = true;
+    }
+
+    void OnHostPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_armed is null || e.Key != Key.Escape) return;
+        DisarmCancel();
+        e.Handled = true;
+    }
+
     void Node_Click(object sender, RoutedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.Tag is Device d) Send(d, null);
+        if ((sender as FrameworkElement)?.Tag is not Device d) return;
+        if (HandleTransferCancelClick(d)) return;
+        DisarmCancel();
+        Send(d, null);
+    }
+
+    void ListRow_Click(object sender, MouseButtonEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.Tag is not Device d) return;
+        if (!HandleTransferCancelClick(d)) return;
+        e.Handled = true;
     }
 
     void Node_DragEnter(object sender, DragEventArgs e) => Highlight(sender, Accepts(sender, e));

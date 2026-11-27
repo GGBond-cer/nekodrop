@@ -18,7 +18,7 @@ public sealed class TransferRecord
     /// <summary>Web URL (http/https) when this record represents a shared link.</summary>
     public string Url { get; set; } = "";
     public long Bytes { get; set; }
-    /// <summary>"done", "failed", or "declined".</summary>
+    /// <summary>"done", "failed", "declined", or "cancelled".</summary>
     public string Status { get; set; } = "done";
     public string Error { get; set; } = "";
     public bool LivePhoto { get; set; }
@@ -28,7 +28,7 @@ public sealed class TransferRecord
     [JsonIgnore] public bool IsReceived => Direction == "received";
     [JsonIgnore] public bool IsSent => Direction == "sent";
     [JsonIgnore] public bool IsLink => !string.IsNullOrEmpty(Url);
-    [JsonIgnore] public bool Failed => Status is "failed" or "declined";
+    [JsonIgnore] public bool Failed => Status is "failed" or "declined" or "cancelled";
     [JsonIgnore] public bool CanOpen => !Failed && (IsLink || Paths.Count > 0);
     [JsonIgnore] public bool CanCopy => !Failed && (IsLink || Paths.Count > 0);
     [JsonIgnore] public bool CanResend => IsSent && Paths.Count > 0;
@@ -49,6 +49,7 @@ public sealed class TransferRecord
     public string StatusText => Status switch
     {
         "declined" => L.T("send.declined"),
+        "cancelled" => L.T("send.cancelled"),
         "failed" => IsSent ? L.T("hist.sendFailed") : L.T("main.incomplete"),
         _ => "",
     };

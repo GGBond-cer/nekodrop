@@ -1086,8 +1086,30 @@ public sealed class App : Application
     {
         var d = Model.Devices.FirstOrDefault(x => x.Ask == r);
         if (d is null) return;
+        d.ConfirmCancel = false;
         d.Ask = null;
         if (d.ForAsk) Model.Devices.Remove(d);
+    }
+
+    /// <summary>Cancels the active send or receive on a device across AirDrop, MTA, and LocalSend.</summary>
+    public void CancelTransfer(Device d)
+    {
+        d.ConfirmCancel = false;
+        if (d.Ask is { Receiving: true } rx)
+        {
+            if (MtaEngine.IsMtaRequest(rx.Id)) Mta.Cancel(rx.Id);
+            else if (LocalSendEngine.IsRequest(rx.Id)) LocalSend.Cancel(rx.Id);
+            else Engine.Cancel(rx.Id);
+            return;
+        }
+        foreach (var (sendId, info) in _sendInfo)
+        {
+            if (info.DeviceId != d.Id) continue;
+            if (MtaEngine.IsMtaPeer(d.Id)) Mta.Cancel(sendId);
+            else if (LocalSendEngine.IsPeer(d.Id)) LocalSend.Cancel(sendId);
+            else Engine.Cancel(sendId);
+            break;
+        }
     }
 
     public void SendTo(Device d)
@@ -1409,15 +1431,17 @@ public sealed class App : Application
                     Model.Requests.Remove(lost);
                     DetachAsk(lost);
                     var reason = (string?)o["reason"] ?? "";
+                    var cancelled = string.Equals(reason, "cancelled", StringComparison.OrdinalIgnoreCase);
                     AddHistory(new TransferRecord
                     {
                         Direction = "received",
                         Peer = lost.Sender,
                         Name = lost.What,
-                        Status = "failed",
-                        Error = reason,
+                        Status = cancelled ? "cancelled" : "failed",
+                        Error = cancelled ? "" : reason,
                     });
-                    Shell.DoneToast(id, L.F("done.lost", lost.Sender), reason, null);
+                    if (!cancelled) Shell.DoneToast(id, L.F("done.lost", lost.Sender), reason, null);
+                    if (_sendInfo.Count == 0 && _requests.Count == 0) Service.TransferDone();
                 }
                 break;
             case "send":
@@ -1425,10 +1449,12 @@ public sealed class App : Application
                 if (!_sendInfo.TryGetValue(id, out var info)) break;
                 var d = Model.Devices.FirstOrDefault(x => x.Id == info.DeviceId);
                 var state = (string?)o["state"];
+                var reason = (string?)o["reason"] ?? "";
+                if (state == "failed" && string.Equals(reason, "cancelled", StringComparison.OrdinalIgnoreCase))
+                    state = "cancelled";
                 var isAirDropSend = !MtaEngine.IsMtaPeer(info.DeviceId) && !LocalSendEngine.IsPeer(info.DeviceId);
                 if (isAirDropSend && state is "sending" or "finishing" && _airDropActive.Add(id))
                     SyncMtaRadioYield();
-                var reason = (string?)o["reason"] ?? "";
                 var failure = state == "failed" ? SendRules.FailureStatus(reason, info.Files) : "";
                 if (d is not null)
                 {
@@ -1443,29 +1469,35 @@ public sealed class App : Application
                         "sending" => txRate is not null ? $"{L.F("send.sending", d.Progress)} · {txRate}" : L.F("send.sending", d.Progress),
                         "sent" or "done" => L.T("send.sent"),
                         "declined" => L.T("send.declined"),
+                        "cancelled" => L.T("send.cancelled"),
                         "failed" => L.T("send.failed") + failure,
                         _ => state ?? "",
                     };
                 }
-                if (state is "sent" or "done" or "declined" or "failed")
+                if (state is "sent" or "done" or "declined" or "failed" or "cancelled")
                 {
                     _txSpeed.Remove(id);
                     _sendInfo.Remove(id);
                     if (_airDropActive.Remove(id)) SyncMtaRadioYield();
                     if (d is not null)
                     {
+                        d.ConfirmCancel = false;
                         d.Busy = false;
-                        // A device that took the files is ready for more a moment later.
-                        if (state is "sent" or "done")
-                            _ = Task.Delay(TimeSpan.FromSeconds(3.5)).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
+                        // A device that took the files (or was cancelled) is ready for more a moment later.
+                        if (state is "sent" or "done" or "cancelled")
+                        {
+                            var expectedState = state is "done" ? "sent" : state;
+                            var resetDelay = state == "cancelled" ? TimeSpan.FromSeconds(2.2) : TimeSpan.FromSeconds(3.5);
+                            _ = Task.Delay(resetDelay).ContinueWith(_ => Dispatcher.BeginInvoke(() =>
                             {
-                                if (d.State != "sent") return;
+                                if (d.State != expectedState) return;
                                 d.State = "";
                                 d.Progress = 0;
                                 d.Status = L.T("dev.ready");
                             }));
+                        }
                     }
-                    if (state is "sent" or "done" && _sendInfo.Count == 0 && _requests.Count == 0) Service.TransferDone();
+                    if (state is "sent" or "done" or "cancelled" && _sendInfo.Count == 0 && _requests.Count == 0) Service.TransferDone();
                     var firstName = info.Files.Count > 0 ? SendRules.Name(info.Files[0]) : L.T("what.some");
                     var summary = info.Files.Count <= 1 ? firstName : L.F("send.summary", firstName, info.Files.Count, info.Files.Count - 1);
                     var failureDetail = state == "failed" ? SendRules.FailureDetail(reason, info.Files) : "";

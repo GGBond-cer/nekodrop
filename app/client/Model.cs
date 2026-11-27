@@ -47,6 +47,11 @@ public sealed class Device : Observable
     public string Status { get => _status; set => Set(ref _status, value); }
     public double Progress { get => _progress; set => Set(ref _progress, value); }
     public bool Busy { get => _busy; set => Set(ref _busy, value); }
+    bool _confirmCancel;
+    /// <summary>Armed to cancel the active transfer on the next click (Option A: auto-disarms on timeout / outside click / Esc).</summary>
+    public bool ConfirmCancel { get => _confirmCancel; set => Set(ref _confirmCancel, value); }
+    /// <summary>True while an active send or receive is running on this device and can be cancelled.</summary>
+    public bool CanCancel => (Busy && State is "asking" or "sending" or "finishing") || Ask is { Receiving: true };
     string _state = "";
     /// <summary>What became of the last send: "", asking, sending, sent, declined or failed (colours the radar).</summary>
     public string State { get => _state; set => Set(ref _state, value); }

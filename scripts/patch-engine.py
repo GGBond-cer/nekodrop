@@ -1833,3 +1833,144 @@ _hook('engine.py', [
         '                del self._watches[watch.key]' + NL,
     ),
 ], 'BEACON_REPULSE_COOLDOWN_S')
+
+# Receive-side cancellation: allow {"do": "cancel", "id": "rN"} to abort an
+# in-progress AirDrop /Upload immediately (closing the socket, discarding temp
+# files, and reporting lost with reason='cancelled' instead of storing partial data).
+_hook('engine.py', [
+    (
+        '        self.uploading = False' + NL +
+        '        self.said = 0.0' + NL,
+        '        self.uploading = False' + NL +
+        '        self.said = 0.0' + NL +
+        '        self.cancelled = False' + NL +
+        '        self._abort = None' + NL,
+    ),
+    (
+        '        self._waiting = {}' + NL +
+        "        self._keys = (f'r{number}' for number in itertools.count(1))" + NL,
+        '        self._waiting = {}' + NL +
+        '        self._active = {}' + NL +
+        "        self._keys = (f'r{number}' for number in itertools.count(1))" + NL,
+    ),
+    (
+        '        accepted.uploading = True' + NL +
+        '        accepted.total = total or accepted.total' + NL +
+        '        accepted.folder = self.settings.dest' + NL +
+        "        self.events.say('incoming', id=accepted.key, done=0, total=accepted.total)" + NL +
+        '        return accepted' + NL,
+        '        with self._lock:' + NL +
+        '            if accepted.cancelled:' + NL +
+        '                return None' + NL +
+        '            accepted.uploading = True' + NL +
+        '            self._active[accepted.key] = accepted' + NL +
+        '        accepted.total = total or accepted.total' + NL +
+        '        accepted.folder = self.settings.dest' + NL +
+        "        self.events.say('incoming', id=accepted.key, done=0, total=accepted.total)" + NL +
+        '        return accepted' + NL,
+    ),
+    (
+        '    def stored(self, token, names):' + NL +
+        "        self.events.say('stored', id=token.key, folder=token.folder or self.settings.dest," + NL +
+        '                        names=names, live=transfer.live_photos(names))' + NL +
+        NL +
+        '    def upload_failed(self, token, reason):' + NL +
+        "        self.events.say('lost', id=token.key, reason=reason)" + NL,
+        '    def bind_abort(self, token, fn):' + NL +
+        '        with self._lock:' + NL +
+        '            token._abort = fn' + NL +
+        '            cancelled = token.cancelled' + NL +
+        '        if cancelled and fn:' + NL +
+        '            try:' + NL +
+        '                fn()' + NL +
+        '            except OSError:' + NL +
+        '                pass' + NL +
+        NL +
+        '    def cancel(self, key):' + NL +
+        '        if self.answer(key, False):' + NL +
+        '            return True' + NL +
+        '        with self._lock:' + NL +
+        '            token = self._active.get(key)' + NL +
+        '            if token is None:' + NL +
+        '                return False' + NL +
+        '            token.cancelled = True' + NL +
+        '            fn = token._abort' + NL +
+        '        if fn:' + NL +
+        '            try:' + NL +
+        '                fn()' + NL +
+        '            except OSError:' + NL +
+        '                pass' + NL +
+        '        return True' + NL +
+        NL +
+        '    def stored(self, token, names):' + NL +
+        '        with self._lock:' + NL +
+        '            self._active.pop(token.key, None)' + NL +
+        '            token._abort = None' + NL +
+        "        self.events.say('stored', id=token.key, folder=token.folder or self.settings.dest," + NL +
+        '                        names=names, live=transfer.live_photos(names))' + NL +
+        NL +
+        '    def upload_failed(self, token, reason):' + NL +
+        '        with self._lock:' + NL +
+        '            self._active.pop(token.key, None)' + NL +
+        '            token._abort = None' + NL +
+        "        self.events.say('lost', id=token.key, reason=reason)" + NL,
+    ),
+    (
+        "        elif do == 'cancel':" + NL +
+        "            self.sending.cancel(str(command.get('id')))" + NL,
+        "        elif do == 'cancel':" + NL +
+        "            cancel_id = str(command.get('id'))" + NL +
+        '            self.sending.cancel(cancel_id)' + NL +
+        '            self.incoming.cancel(cancel_id)' + NL,
+    ),
+], 'def bind_abort(', 'AirDrop receive-side cancellation')
+
+_hook('receiver.py', [
+    (
+        '        deadline = transfer.ReadDeadline()' + NL +
+        '        plan = None' + NL +
+        '        refused = None' + NL,
+        '        def _abort_upload():' + NL +
+        '            try:' + NL +
+        '                self.request.shutdown(socket.SHUT_RDWR)' + NL +
+        '            except OSError:' + NL +
+        '                pass' + NL +
+        '            try:' + NL +
+        '                self.request.close()' + NL +
+        '            except OSError:' + NL +
+        '                pass' + NL +
+        "        bind_abort = getattr(watcher, 'bind_abort', None)" + NL +
+        '        if bind_abort:' + NL +
+        '            bind_abort(token, _abort_upload)' + NL +
+        '        deadline = transfer.ReadDeadline()' + NL +
+        '        plan = None' + NL +
+        '        refused = None' + NL,
+    ),
+    (
+        '        finally:' + NL +
+        '            transfer.UPLOAD_SLOTS.release()' + NL +
+        '            self.request.settimeout(transfer.READ_IDLE_TIMEOUT_SECONDS)' + NL +
+        '        if refused:' + NL +
+        '            watcher.upload_failed(token, refused[1])' + NL +
+        '            self.reject(*refused)' + NL +
+        '            return' + NL,
+        '        finally:' + NL +
+        '            if bind_abort:' + NL +
+        '                bind_abort(token, None)' + NL +
+        '            transfer.UPLOAD_SLOTS.release()' + NL +
+        "            if not getattr(token, 'cancelled', False):" + NL +
+        '                try:' + NL +
+        '                    self.request.settimeout(transfer.READ_IDLE_TIMEOUT_SECONDS)' + NL +
+        '                except OSError:' + NL +
+        '                    pass' + NL +
+        "        if getattr(token, 'cancelled', False):" + NL +
+        "            logging.info('upload %s: cancelled locally', tid)" + NL +
+        "            watcher.upload_failed(token, 'cancelled')" + NL +
+        '            self.close_connection = True' + NL +
+        '            return' + NL +
+        '        if refused:' + NL +
+        '            watcher.upload_failed(token, refused[1])' + NL +
+        '            self.reject(*refused)' + NL +
+        '            return' + NL,
+    ),
+], 'def _abort_upload(', 'AirDrop receive-side cancellation')
