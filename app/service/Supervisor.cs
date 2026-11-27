@@ -486,7 +486,19 @@ public sealed class Supervisor : IDisposable
         try
         {
             KillDaemons();
-            if (giveBack) EnsureVendorDriver(reconnect: true);
+            if (giveBack)
+            {
+                // The disconnected TAP used to keep its router-assigned IPv4
+                // address and the only default route. Windows then joined Wi-Fi
+                // with APIPA only (no Internet, and sometimes a password
+                // prompt after the stale lease expired). Release it before the
+                // vendor driver comes back, so Windows' Wi-Fi gets the lease.
+                var released = TapNet.Release();
+                Say(released == ""
+                    ? "Wi-Fi: released the TAP address and default route before giving the card back"
+                    : "Wi-Fi: could not release the TAP address: " + released);
+                EnsureVendorDriver(reconnect: true);
+            }
             lock (_lock) { State = RadioState.Off; _wifi = ""; _channel = 0; }
         }
         finally { _launchGate.Release(); }
