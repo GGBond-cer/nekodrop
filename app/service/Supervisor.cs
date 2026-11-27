@@ -43,6 +43,12 @@ public sealed class Supervisor : IDisposable
     static readonly TimeSpan StaleScan = TimeSpan.FromSeconds(20);
     string _detail = "";
     bool _wanted;
+    /// <summary>The give-back task restores Windows' profiles and may retry through PnP.</summary>
+    Task? _wifiReconnect;
+    /// <summary>Invalidates a give-back task when a new start/stop begins.</summary>
+    int _wifiEpoch;
+    /// <summary>Cancels a give-back task's DHCP/connect wait when the card changes hands.</summary>
+    CancellationTokenSource _wifiCancel = new();
     bool _earlyFirmwareError, _holdFirmwareRetry;
     DateTime _lastUse = DateTime.UtcNow, _lastData = DateTime.UtcNow, _startedAt;
     long _rxToUs;
@@ -464,6 +470,9 @@ public sealed class Supervisor : IDisposable
             if (_cts.IsCancellationRequested) return;
             if (_wanted && State is RadioState.On or RadioState.Starting) return;
             _wanted = true;
+            _wifiEpoch++;
+            _wifiCancel.Cancel();
+            _wifiCancel = new();
             _holdFirmwareRetry = false;
             _restarts = 0;
             _retryAt = DateTime.MinValue;
@@ -478,14 +487,28 @@ public sealed class Supervisor : IDisposable
 
     public void Stop(string why, bool giveBack)
     {
-        lock (_lock) _wanted = false;
+        int epoch;
+        lock (_lock)
+        {
+            _wanted = false;
+            epoch = ++_wifiEpoch;
+            _wifiCancel.Cancel();
+            _wifiCancel = new();
+        }
         Say($"stopping: {why}");
         // Serialized with launches (round 2 #7): a launch in progress sees
         // _wanted false at its next check and returns; then the card goes back.
         _launchGate.Wait();
         try
         {
-            KillDaemons();
+            // A give-back task from the previous session may still be waiting
+            // for DHCP or its PnP fallback. Do not let it touch the card while
+            // this stop is binding the vendor driver: that used to add a second
+            // restart and a full extra 12 s to the hand-back.
+            WaitForWifiReconnect("before stopping");
+            var sw = Stopwatch.StartNew();
+            bool cleanRadio = KillDaemons();
+            Say($"timing: radio stopped in {sw.ElapsedMilliseconds} ms (clean={cleanRadio})");
             if (giveBack)
             {
                 // The disconnected TAP used to keep its router-assigned IPv4
@@ -493,16 +516,41 @@ public sealed class Supervisor : IDisposable
                 // with APIPA only (no Internet, and sometimes a password
                 // prompt after the stale lease expired). Release it before the
                 // vendor driver comes back, so Windows' Wi-Fi gets the lease.
-                var released = TapNet.Release();
-                Say(released == ""
-                    ? "Wi-Fi: released the TAP address and default route before giving the card back"
-                    : "Wi-Fi: could not release the TAP address: " + released);
-                EnsureVendorDriver(reconnect: true);
+                // It is independent of the PCI bind; run both concurrently.
+                var releaseWatch = Stopwatch.StartNew();
+                var releaseTask = Task.Run(() =>
+                {
+                    var result = TapNet.Release();
+                    return (Result: result, ElapsedMs: releaseWatch.ElapsedMilliseconds);
+                });
+                EnsureVendorDriver(reconnect: true, resetCard: !cleanRadio, epoch: epoch);
+                var release = releaseTask.GetAwaiter().GetResult();
+                Say(release.Result == ""
+                    ? $"Wi-Fi: released the TAP address and default route before giving the card back ({release.ElapsedMs} ms)"
+                    : "Wi-Fi: could not release the TAP address: " + release.Result);
             }
             lock (_lock) { State = RadioState.Off; _wifi = ""; _channel = 0; }
         }
         finally { _launchGate.Release(); }
         Publish();
+    }
+
+    /// <summary>Waits for the previous give-back task before taking or releasing the card.</summary>
+    void WaitForWifiReconnect(string why)
+    {
+        Task? task;
+        lock (_lock) task = _wifiReconnect;
+        if (task is null || task.IsCompleted) return;
+        Say($"Wi-Fi: waiting for the previous reconnect before {why}");
+        try
+        {
+            if (!task.Wait(TimeSpan.FromSeconds(20)))
+                Say("Wi-Fi: the previous reconnect is still running after 20 s; continuing with the card");
+        }
+        catch (AggregateException e)
+        {
+            Say("Wi-Fi: the previous reconnect failed: " + e.GetBaseException().Message);
+        }
     }
 
     /// <summary>One launch at a time: the watchdog, a wake, a mode change and a channel move
@@ -518,6 +566,8 @@ public sealed class Supervisor : IDisposable
 
     void LaunchLocked(int channel)
     {
+        if (!_wanted) return;
+        WaitForWifiReconnect("taking the card");
         if (!_wanted) return;
         lock (_lock)
         {
@@ -1499,24 +1549,33 @@ public sealed class Supervisor : IDisposable
     /// <summary>The card runs nekodrop's kernel Wi-Fi driver (nekodrop-wlan.sys).</summary>
     static bool KernelDriver => Card.Find() is { } k && Card.ByKernelDriver(k);
 
-    void EnsureVendorDriver(bool reconnect = false)
+    void EnsureVendorDriver(bool reconnect = false, bool resetCard = true, int epoch = -1)
     {
         var card = Card.Find();
         // Ours (running or not), or left with no driver by a failed bind: the vendor's driver goes back on.
-        if (card is null || (!Card.BoundToProxy(card) && card.InfPath != ""))
+        var ours = card is not null && (Card.BoundToProxy(card) || Card.ByKernelDriver(card));
+        if (card is null || (!ours && card.InfPath != ""))
         {
             if (reconnect)
             {
+                var instance = card?.InstanceId ?? "";
                 if (card is { InfPath: not "" })
                 {
-                    try
+                    if (resetCard)
                     {
-                        Card.Restart(card.InstanceId);
-                        Say($"Wi-Fi: restarted the Wi-Fi device ({Path.GetFileName(card.InfPath)})");
+                        try
+                        {
+                            Card.Restart(card.InstanceId);
+                            Say($"Wi-Fi: restarted the Wi-Fi device ({Path.GetFileName(card.InfPath)})");
+                        }
+                        catch (Exception e) { Say("Wi-Fi: " + e.Message); }
                     }
-                    catch (Exception e) { Say("Wi-Fi: " + e.Message); }
+                    else
+                    {
+                        Say("Wi-Fi: skipped the PnP restart after a clean radio stop");
+                    }
                 }
-                ReconnectWindowsWifi();
+                ReconnectWindowsWifi(instance, resetOnFailure: true, epoch: epoch);
             }
             return;
         }
@@ -1554,18 +1613,20 @@ public sealed class Supervisor : IDisposable
         try
         {
             Say($"giving the card back to {Path.GetFileName(fullInf)}");
+            var bindWatch = Stopwatch.StartNew();
             Card.Bind(card.HardwareId, fullInf);
+            Say($"Wi-Fi: driver binding returned after {bindWatch.ElapsedMilliseconds} ms");
             // Once the vendor driver's WLAN interface is up, put back the saved networks it lacks.
             // On a user-requested give-back, also join the default network instead of leaving
             // Windows disconnected until the user clicks the Wi-Fi icon.
-            if (reconnect) ReconnectWindowsWifi();
+            if (reconnect) ReconnectWindowsWifi(card.InstanceId, resetOnFailure: true, epoch: epoch);
             else _ = Task.Run(() => WlanBackup.Restore(Say, TimeSpan.FromSeconds(60)));
         }
         catch (Exception e) { Say("giving the card back failed: " + e.Message); }
     }
 
     /// <summary>Gives the card back, then asks Windows to join its default saved Wi-Fi.</summary>
-    void ReconnectWindowsWifi()
+    void ReconnectWindowsWifi(string instanceId = "", bool resetOnFailure = false, int epoch = -1)
     {
         var preferred = _net?.Ssid;
         if (string.IsNullOrWhiteSpace(preferred))
@@ -1588,7 +1649,33 @@ public sealed class Supervisor : IDisposable
             Say("Wi-Fi: not reconnecting after AirDrop: Wi-Fi was disconnected in nekodrop");
             return;
         }
-        _ = Task.Run(() => WlanBackup.RestoreAndConnect(Say, preferred));
+        CancellationToken token;
+        lock (_lock) token = _wifiCancel.Token;
+        var task = Task.Run(() =>
+        {
+            var ok = WlanBackup.RestoreAndConnect(Say, preferred, token);
+            // A newer start/stop has taken over the card. Never run a PnP
+            // restart from an old session: it would reset the card while the
+            // next session is binding it.
+            if (token.IsCancellationRequested || (epoch >= 0 && epoch != Volatile.Read(ref _wifiEpoch))) return;
+            if (ok || !resetOnFailure || string.IsNullOrEmpty(instanceId)) return;
+            // Fast path failed to reach IPv4 Internet. Keep the clean-stop
+            // shortcut for the common case, but do not leave the card in a
+            // degraded state: retry once through the full PnP reset.
+            Say("Wi-Fi: fast path did not reach IPv4 Internet; retrying with a PnP device restart");
+            try
+            {
+                var card = Card.Find();
+                if (card is { InfPath: not "" } && !Card.BoundToProxy(card) && !Card.ByKernelDriver(card))
+                {
+                    Card.Restart(card.InstanceId);
+                    if (token.IsCancellationRequested || (epoch >= 0 && epoch != Volatile.Read(ref _wifiEpoch))) return;
+                    WlanBackup.RestoreAndConnect(Say, preferred, token);
+                }
+            }
+            catch (Exception e) { Say("Wi-Fi: PnP fallback failed: " + e.Message); }
+        });
+        lock (_lock) _wifiReconnect = task;
     }
 
     Process Spawn(string exe, IEnumerable<string> args, Action<string> onLine)
@@ -1611,8 +1698,15 @@ public sealed class Supervisor : IDisposable
         return p;
     }
 
-    void KillDaemons()
+    /// <summary>
+    /// Stops the radio and awdld. Returns true only when the Intel radio
+    /// exited through `quit` with a clean IwxDevice::stop(); a hard kill, a
+    /// timeout or a non-zero radio exit means the caller must keep the PnP
+    /// restart as the fallback.
+    /// </summary>
+    bool KillDaemons()
     {
+        bool clean = true;
         foreach (var p in new[] { _awdld, _radio })
         {
             try
@@ -1636,16 +1730,30 @@ public sealed class Supervisor : IDisposable
                             p.StandardInput.Close();
                         }
                         catch (Exception) { }
-                        if (p.WaitForExit(6000)) continue;
+                        if (p.WaitForExit(6000))
+                        {
+                            if (ReferenceEquals(p, _radio) && _profile.Backend == RadioBackendKind.Iwx)
+                                clean &= p.ExitCode == 0;
+                            continue;
+                        }
+                        clean = false;
                         Say($"WARNING: {_profile.Backend} radio did not exit within 6 s after quit; forcing termination");
                     }
                     p.Kill();
                     p.WaitForExit(5000);
+                    if (ReferenceEquals(p, _radio)) clean = false;
+                }
+                else if (ReferenceEquals(p, _radio) && p is not null)
+                {
+                    // It exited before Stop() reached it. A clean radio exit is
+                    // only trustworthy when the process reported success.
+                    clean &= p.ExitCode == 0;
                 }
             }
-            catch (InvalidOperationException) { }
+            catch (InvalidOperationException) { if (ReferenceEquals(p, _radio)) clean = false; }
         }
         _awdld = _radio = null;
+        return clean;
     }
 
     public void Dispose()

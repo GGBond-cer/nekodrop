@@ -103,13 +103,14 @@ public static class WlanBackup
     /// interface's folder) that the current WLAN interface lacks. Waits up to
     /// `wait` for Intel's interface to appear. Returns the number added.
     /// </summary>
-    public static int Restore(Action<string> say, TimeSpan wait)
+    public static int Restore(Action<string> say, TimeSpan wait, CancellationToken token = default)
     {
         try
         {
             var end = DateTime.UtcNow + wait;
             while (true)
             {
+                if (token.IsCancellationRequested) return 0;
                 if (Open(out var h))
                 {
                     try
@@ -119,7 +120,7 @@ public static class WlanBackup
                     finally { WlanCloseHandle(h, IntPtr.Zero); }
                 }
                 if (DateTime.UtcNow >= end) return 0;
-                Thread.Sleep(1000);
+                if (token.WaitHandle.WaitOne(1000)) return 0;
             }
         }
         catch (Exception e)
@@ -131,19 +132,30 @@ public static class WlanBackup
 
     /// <summary>
     /// After the vendor driver gets the card back: restore the saved profiles,
-    /// then ask Windows to join its default saved network. Windows often stays
-    /// disconnected after a driver swap even with auto-connect profiles.
+    /// then ask Windows to join its default saved network. Returns true only
+    /// when IPv4/DHCP is usable, so a clean-stop shortcut can fall back to PnP
+    /// instead of leaving a connected-but-degraded card behind.
     /// </summary>
-    public static void RestoreAndConnect(Action<string> say, string? preferredSsid = null)
+    public static bool RestoreAndConnect(Action<string> say, string? preferredSsid = null, CancellationToken token = default)
     {
-        Restore(say, TimeSpan.FromSeconds(60));
-        if (Wlan.Current(out _, readKey: false) is not null) return;
+        if (token.IsCancellationRequested) return false;
+        // Windows often auto-joins as soon as the Intel interface is back.
+        // Wlan.Current can still fail for a few seconds on that fresh
+        // interface; the IP state is the ground truth, and avoids a pointless
+        // ConnectDefault / 10 s IPv4 wait.
+        if (Wlan.Ipv4Ready()) return true;
+        Restore(say, TimeSpan.FromSeconds(60), token);
+        if (token.IsCancellationRequested) return false;
+        if (Wlan.Ipv4Ready()) return true;
+        if (Wlan.Current(out _, readKey: false) is not null)
+            return Wlan.WaitForIpv4(TimeSpan.FromSeconds(10), token);
         if (Wlan.WiredUp())
         {
             say("Wi-Fi: a wired connection is up; not reconnecting Windows to Wi-Fi");
-            return;
+            return true;
         }
-        Wlan.ConnectDefault(say, preferredSsid);
+        return Wlan.ConnectDefault(say, preferredSsid, token) &&
+               Wlan.WaitForIpv4(TimeSpan.FromSeconds(10), token);
     }
 
     static int RestoreTo(IntPtr h, Guid guid, Action<string> say)

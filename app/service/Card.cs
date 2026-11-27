@@ -182,7 +182,11 @@ public static class Card
             if (p is null) return false;
             var output = p.StandardOutput.ReadToEndAsync();
             var errors = p.StandardError.ReadToEndAsync();
-            if (!p.WaitForExit(30000)) { try { p.Kill(); } catch { } return false; }
+            if (!p.WaitForExit(30000))
+            {
+                try { p.Kill(); } catch { }
+                throw new InvalidOperationException("pnputil /restart-device timed out");
+            }
             string text = ((output.Wait(1000) ? output.Result : "") + " " +
                            (errors.Wait(1000) ? errors.Result : "")).Trim();
             if (p.ExitCode != 0)

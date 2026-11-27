@@ -1889,7 +1889,13 @@ int main(int argc, char **argv) {
       tap_thread.join();
     }
     if (!dev.healthy()) log_line("the card stopped answering or the firmware failed");
-    dev.stop();
+    bool clean = true;
+    if constexpr (std::is_same_v<Dev, IwxDevice>) clean = dev.stop();
+    else dev.stop();
+    if (!clean) {
+      failed = true;
+      log_line("device stop did not complete cleanly; a PnP restart is required");
+    }
     };
     if (opt.kernel) {
       KernelDevice kdev(log_line);
