@@ -216,5 +216,79 @@ class QueryBursts(unittest.TestCase):
         self.assertEqual(len([target for _, target in replies if target[0] != mdns.GROUP]), 64)
 
 
+class SelfLoopbackFilter(unittest.TestCase):
+    def test_announcer_ignores_queries_from_own_address(self):
+        own_variants = [
+            str(ADDRESS),
+            f'{ADDRESS}%7',
+            f'{ADDRESS.exploded.upper()}%7',
+        ]
+        incoming = []
+        for src in own_variants:
+            pkt = mdns.query([(SERVICE.type_name, mdns.TYPE_PTR)])
+            incoming.append((pkt, (src, mdns.PORT, 0, 7)))
+            qu_pkt = pkt[:-2] + b'\x80\x01'
+            incoming.append((qu_pkt, (src, mdns.PORT, 0, 7)))
+        peer_qu = mdns.query([(SERVICE.type_name, mdns.TYPE_PTR)])[:-2] + b'\x80\x01'
+        incoming.append((peer_qu, ('fe80::2%7', mdns.PORT, 0, 7)))
+
+        with patch.object(mdns, 'open_socket') as open_socket:
+            announcer = mdns.Announcer(SERVICE, 7)
+            sock = open_socket.return_value
+
+            def receive(_):
+                if incoming:
+                    return incoming.pop(0)
+                announcer.stopping.set()
+                raise TimeoutError()
+
+            sock.recvfrom.side_effect = receive
+            with patch.object(mdns.time, 'monotonic', side_effect=itertools.count(0, 0.01)):
+                announcer._run()
+            sent = [call.args for call in sock.sendto.call_args_list]
+
+        # 1 initial periodic announcement + 1 unicast & 1 multicast reply for fe80::2;
+        # none of the 6 self-originated queries should trigger replies.
+        unicast = [target for _, target in sent if target[0] != mdns.GROUP]
+        multicast = [target for _, target in sent if target[0] == mdns.GROUP]
+        self.assertEqual(unicast, [('fe80::2%7', mdns.PORT, 0, 7)])
+        self.assertEqual(len(multicast), 2)
+
+    def test_browser_ignores_responses_from_own_address(self):
+        peer_service = mdns.Service('_airdrop._tcp.local', '112233445566',
+                                    '112233445566.local', 'fe80::2', 8771, 'flags=1019')
+        incoming = [
+            (SERVICE.response(), (f'{ADDRESS}%7', mdns.PORT, 0, 7)),
+            (SERVICE.response(), (ADDRESS.exploded.upper(), mdns.PORT, 0, 7)),
+            (peer_service.response(), ('fe80::2%7', mdns.PORT, 0, 7)),
+        ]
+        with patch.object(mdns, 'open_socket') as open_socket, \
+                patch.object(mdns.netif, 'link_local_address', return_value=str(ADDRESS)):
+            browser = mdns.Browser('_airdrop._tcp.local', 7)
+            sock = open_socket.return_value
+            sock.recvfrom.side_effect = lambda _: incoming.pop(0)
+
+            self.assertEqual(browser.poll(), {})
+            self.assertEqual(browser.heard, 0)
+            self.assertEqual(browser.poll(), {})
+            self.assertEqual(browser.heard, 0)
+
+            located = browser.poll()
+            self.assertEqual(browser.heard, 1)
+            self.assertEqual(located, {peer_service.instance_name: ('fe80::2', 8771)})
+
+    def test_browser_handles_missing_own_address(self):
+        peer_service = mdns.Service('_airdrop._tcp.local', '112233445566',
+                                    '112233445566.local', 'fe80::2', 8771, 'flags=1019')
+        with patch.object(mdns, 'open_socket') as open_socket, \
+                patch.object(mdns.netif, 'link_local_address', return_value=None):
+            browser = mdns.Browser('_airdrop._tcp.local', 7)
+            sock = open_socket.return_value
+            sock.recvfrom.return_value = (peer_service.response(), ('fe80::2%7', mdns.PORT, 0, 7))
+            located = browser.poll()
+            self.assertEqual(browser.heard, 1)
+            self.assertEqual(located, {peer_service.instance_name: ('fe80::2', 8771)})
+
+
 if __name__ == '__main__':
     unittest.main()

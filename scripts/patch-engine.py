@@ -709,6 +709,63 @@ if 'MAX_RECENT_QU_REPLIES = 64' not in text:
     mdns.write_text(text, encoding='utf-8')
     print('mdns.py: keep distinct unicast responses during query bursts')
 
+# Ignore our own awdl0 link-local IPv6 address in mDNS Announcer & Browser:
+# on Windows Winsock, IPV6_MULTICAST_LOOP=0 only suppresses loopback to the
+# sending socket itself, not between Browser.sock and Announcer.sock bound with
+# SO_REUSEADDR on port 5353, which otherwise made nekodrop list itself as a peer
+# once Contacts Only / Everyone allowed self-/Discover, and caused Announcer to
+# reply to Browser's own periodic queries.
+text = mdns.read_text(encoding='utf-8')
+if '_own_address' not in text:
+    self_pairs = [
+        (
+            'import ipaddress\nimport logging\n',
+            'import ipaddress\nimport logging\nimport netif\n',
+        ),
+        (
+            'def encode_name(name):\n',
+            'def _parse_ipv6(address):\n'
+            '    if not address:\n'
+            '        return None\n'
+            '    try:\n'
+            "        return ipaddress.IPv6Address(str(address).split('%')[0])\n"
+            '    except ValueError:\n'
+            '        return None\n\n\n'
+            'def encode_name(name):\n',
+        ),
+        (
+            '    def __init__(self, service_type, interface_index):\n'
+            '        self.instances = Instances(service_type)\n'
+            '        self.interface_index = interface_index\n',
+            '    def __init__(self, service_type, interface_index, own_address=None):\n'
+            '        self.instances = Instances(service_type)\n'
+            '        self.interface_index = interface_index\n'
+            '        _addr = own_address if own_address is not None else netif.link_local_address(interface_index)\n'
+            '        self._own_address = _parse_ipv6(_addr)\n',
+        ),
+        (
+            "        if sender[3] == self.interface_index:\n"
+            "            self.heard += bool(response_records(packet))\n"
+            "            self.instances.feed(packet, sender[0].split('%')[0])",
+            "        src = sender[0].split('%')[0]\n"
+            "        if sender[3] == self.interface_index and (self._own_address is None or _parse_ipv6(src) != self._own_address):\n"
+            "            self.heard += bool(response_records(packet))\n"
+            "            self.instances.feed(packet, src)",
+        ),
+        (
+            '        if sender[3] != self.interface_index:\n'
+            '            return False',
+            "        if sender[3] != self.interface_index or _parse_ipv6(sender[0]) == self.service.address:\n"
+            '            return False',
+        ),
+    ]
+    for old, new in self_pairs:
+        if text.count(old) != 1:
+            sys.exit(f'mdns.py self-filter: {old[:60]!r} moved; update patch-engine.py')
+        text = text.replace(old, new, 1)
+    mdns.write_text(text, encoding='utf-8')
+    print('mdns.py: ignore local awdl0 multicast loopback between sockets')
+
 # Link sharing & media format support:
 # - Extract http(s) URLs from AirDrop Ask Items even when an app (e.g. Bilibili,
 #   Xiaohongshu, WeChat) wraps the link with title text or omits TransferType.links
