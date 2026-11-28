@@ -25,6 +25,10 @@ public sealed class KnownNetworks
         public bool AutoConnect { get; set; } = true;
         public bool Hidden { get; set; }
         public DateTime LastUsed { get; set; }
+        // LastUsed is a request/import hint for Windows hand-back. These two
+        // timestamps are only written after the station's IPv4 gateway answers.
+        public DateTime LastSuccess { get; set; }
+        public DateTime LastManualSuccess { get; set; }
         [JsonIgnore] public bool HasKey => Open || Passphrase is not null || PskHex is not null;
     }
 
@@ -72,6 +76,28 @@ public sealed class KnownNetworks
     public List<Entry> All()
     {
         lock (_lock) return [.. _entries.OrderByDescending(e => e.LastUsed)];
+    }
+
+    internal WifiSelection.Profile? SelectionProfile(string ssid)
+    {
+        lock (_lock)
+        {
+            var e = _entries.FirstOrDefault(e => e.Ssid == ssid);
+            return e is null ? null : new(e.AutoConnect, e.Open, e.Passphrase is not null,
+                                          e.PskHex is not null, e.LastSuccess, e.LastManualSuccess);
+        }
+    }
+
+    internal void ConfirmConnection(string ssid, bool manual, DateTime now)
+    {
+        lock (_lock)
+        {
+            if (_entries.FirstOrDefault(e => e.Ssid == ssid) is not { } e) return;
+            e.LastSuccess = now;
+            e.LastUsed = now;
+            if (manual) e.LastManualSuccess = now;
+            Save();
+        }
     }
 
     /// <summary>Adds or updates a network (a new password replaces the old one).</summary>

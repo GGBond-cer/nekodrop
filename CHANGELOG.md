@@ -6,6 +6,20 @@
 
 ---
 
+## Unreleased / 待发布
+
+### 中文
+
+- **改进并发模式的 Wi-Fi 自动重连**：正常连接不中断。需要重连时，优先选择信号可用的、用户曾手动选并连通或最近连通的已保存网络；同名双频网络优先选信号够用的 5 GHz，找不到可用的 5 GHz 时回退到 2.4 GHz。失败的接入点短暂跳过。连接历史在网关可达后才更新。
+- **诊断报告新增 Windows 睡眠／唤醒时间线**，可用变慢时的时间对照。自动重连逻辑已做离线测试，闲置降速场景仍待真机验证。
+
+### English
+
+- **Improve Wi-Fi reconnection in Concurrent mode**: keep working connections. When reconnecting, prefer viable saved networks that the user successfully selected or that recently worked. Within the same SSID, prefer a usable 5 GHz access point, fall back to 2.4 GHz, and briefly skip failed access points. Connection history is updated only after the gateway responds.
+- **Add recent Windows sleep/wake transitions to the diagnostic report.** The reconnection policy has offline tests; the reported post-idle slowdown still needs hardware retesting.
+
+---
+
 ## v2.3.11 (Preview / 预览版)
 
 ### 中文

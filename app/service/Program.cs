@@ -3,16 +3,16 @@
 // memory, creating the AWDL adapter and reading the Wi-Fi profile need no UAC.
 using NekoDrop.Service;
 
-// --selftest: checks the card catalog offline (no card, registry or administrator
+// --selftest: checks the card catalog and Wi-Fi selection offline (no card, registry or administrator
 // rights), so scripts\build-installer.ps1 runs it on the build machine.
 if (args.Contains("--selftest"))
 {
-    var failures = CardCatalog.SelfTest();
+    var failures = CardCatalog.SelfTest().Concat(WifiSelection.SelfTest()).ToArray();
     foreach (var f in failures) Console.Error.WriteLine("FAIL: " + f);
-    Console.WriteLine(failures.Count == 0
-        ? $"card catalog self-test passed ({CardCatalog.AllProfiles.Count} profiles, {CardCatalog.ActiveProfiles.Count} active)"
-        : $"card catalog self-test: {failures.Count} failure(s)");
-    Environment.ExitCode = failures.Count == 0 ? 0 : 1;
+    Console.WriteLine(failures.Length == 0
+        ? $"card catalog and Wi-Fi selection self-tests passed ({CardCatalog.AllProfiles.Count} profiles, {CardCatalog.ActiveProfiles.Count} active)"
+        : $"service self-test: {failures.Length} failure(s)");
+    Environment.ExitCode = failures.Length == 0 ? 0 : 1;
     return;
 }
 

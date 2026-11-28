@@ -29,13 +29,20 @@ public sealed class Supervisor : IDisposable
     string _wifi = "";
     /* Wi-Fi management (the list, connect, forget, auto-connect) */
     readonly KnownNetworks _known = KnownNetworks.Load();
-    List<JsonObject> _scan = [], _scanPending = [];
+    List<WifiSelection.AccessPoint> _scan = [], _scanPending = [];
     bool _scanBusy, _wantBootScan, _channelOpen;
     int _launchGen;
     DateTime _scanAt = DateTime.MinValue, _wifiDownSince = DateTime.UtcNow;
     bool _userChose, _userOff;
     string _staSsid = "", _wifiError = "";
-    (string Ssid, string? Password, bool? Auto)? _pendingConnect;
+    enum JoinOrigin { Inherited, Manual, Automatic }
+    (string Ssid, string? Password, bool? Auto, JoinOrigin Origin, bool Retry)? _pendingConnect;
+    readonly Dictionary<(string Ssid, string Bssid), DateTime> _failedAccessPoints = [];
+    Wlan.Network? _runningStation;
+    Wlan.Network? _pendingManualSuccess;
+    JoinOrigin _joinOrigin, _runningJoinOrigin;
+    bool _wifiJoinQueued, _stationRecorded, _runningStationConnected, _runningUserChose;
+    int _stationVersion;
     int _pendingScans; // scans that missed the pending network so far
     int _mtkBackgroundScans; // repeated MT792x off-channel scans while Wi-Fi is down
     string? _mtkBackgroundScanSsid;
@@ -121,15 +128,21 @@ public sealed class Supervisor : IDisposable
                 ["scanning"] = _scanBusy,
                 ["wifiError"] = _wifiError,
                 ["concurrentFallback"] = _fallbackReason,
-                ["networks"] = new JsonArray(_scan.Select(n =>
-                {
-                    var c = (JsonObject)n.DeepClone();
-                    var known = _known.Find((string?)n["ssid"] ?? "");
-                    c["saved"] = known is { HasKey: true };
-                    c["auto"] = known?.AutoConnect ?? false;
-                    c["connected"] = (string?)n["ssid"] == _staSsid && _wifi == "connected";
-                    return (JsonNode)c;
-                }).ToArray()),
+                ["networks"] = new JsonArray(_scan.GroupBy(ap => ap.Ssid, StringComparer.Ordinal)
+                    .Select(g => g.FirstOrDefault(ap => _runningStationConnected && _runningStation is { } active &&
+                                      ap.Ssid == active.Ssid && ap.Bssid.Equals(active.Bssid, StringComparison.OrdinalIgnoreCase))
+                                 ?? WifiSelection.ForName(g, _known.SelectionProfile(g.Key)) ?? g.MaxBy(ap => ap.Dbm)!)
+                    .OrderByDescending(ap => ap.Dbm).Select(ap =>
+                    {
+                        var known = _known.Find(ap.Ssid);
+                        return (JsonNode)new JsonObject
+                        {
+                            ["ssid"] = ap.Ssid, ["bssid"] = ap.Bssid, ["channel"] = ap.Channel,
+                            ["dbm"] = ap.Dbm, ["security"] = ap.Security,
+                            ["saved"] = known is { HasKey: true }, ["auto"] = known?.AutoConnect ?? false,
+                            ["connected"] = ap.Ssid == _staSsid && _wifi == "connected",
+                        };
+                    }).ToArray()),
                 ["known"] = new JsonArray(_known.All().Select(k =>
                     (JsonNode)new JsonObject { ["ssid"] = k.Ssid, ["auto"] = k.AutoConnect, ["hidden"] = k.Hidden }).ToArray()),
             };
@@ -491,6 +504,11 @@ public sealed class Supervisor : IDisposable
         lock (_lock)
         {
             _wanted = false;
+            _wifiJoinQueued = false;
+            _runningStation = null;
+            _runningStationConnected = false;
+            _pendingManualSuccess = null;
+            _stationVersion++;
             epoch = ++_wifiEpoch;
             _wifiCancel.Cancel();
             _wifiCancel = new();
@@ -581,6 +599,10 @@ public sealed class Supervisor : IDisposable
             _channelOpen = false;
             _hiddenProbed.Clear();
             _launchGen++;
+            _runningStation = null;
+            _runningStationConnected = false;
+            _stationRecorded = false;
+            _stationVersion++;
             _scanPending = [];
         }
         Publish();
@@ -588,6 +610,7 @@ public sealed class Supervisor : IDisposable
         {
             KillDaemons();
             string? staConf = null;
+            Wlan.Network? stationNet = null;
             var kernel = KernelDriver;
             if (!kernel && EffectiveMode() == NetMode.Concurrent)
             {
@@ -638,7 +661,7 @@ public sealed class Supervisor : IDisposable
                 }
                 if (fresh is not null)
                 {
-                    _net = fresh;
+                    lock (_lock) { _net = fresh; _joinOrigin = JoinOrigin.Inherited; _pendingManualSuccess = null; }
                     _known.Remember(fresh.Ssid, fresh.Passphrase, fresh.PskHex, fresh.Open);
                     // A card whose station joins only 5 GHz (MT7902): Windows' 2.4 GHz access
                     // point is no use, so the radio looks for the network's 5 GHz one by name.
@@ -646,7 +669,7 @@ public sealed class Supervisor : IDisposable
                     {
                         Say($"Wi-Fi: Windows was on \"{fresh.Ssid}\" at 2.4 GHz; this card joins 5 GHz only, so nekodrop scans for its 5 GHz access point");
                         _net = null;
-                        lock (_lock) { _pendingConnect = (fresh.Ssid, null, null); _wantBootScan = true; }
+                        lock (_lock) { _pendingConnect = (fresh.Ssid, null, null, JoinOrigin.Inherited, false); _wantBootScan = true; }
                     }
                 }
                 var net = _userOff ? null : _net;
@@ -656,6 +679,7 @@ public sealed class Supervisor : IDisposable
                     string? staMac;
                     lock (_lock) staMac = _cfg.KeepWindowsMac ? TapMac.FormatColon(_cfg.WindowsMac) : null;
                     staConf = Wlan.WriteStaConfig(net, _cfg.DataPlaneAccel, _cfg.StationWifi6, staMac);
+                    stationNet = net;
                     Say($"Wi-Fi: joining \"{net.Ssid}\" ({net.Security}, channel {net.Channel}) beside AirDrop" +
                         (staMac is not null ? " (using Windows' Wi-Fi MAC address)" : ""));
                 }
@@ -688,7 +712,15 @@ public sealed class Supervisor : IDisposable
             var launch = CardCatalog.BuildRadioLaunch(_profile, channel, kernel, _cfg.Country, staConf, true, _cfg.FastUnlock,
                                                       _cfg.CoexPlan, btCoexBalanced: true, highThroughput: _cfg.HighThroughput);
             _startedAt = DateTime.UtcNow;
-            var radio = _radio = Spawn(Path.Combine(_root, "radio", launch.ExeName), launch.Args, OnRadioLine);
+            int gen;
+            lock (_lock)
+            {
+                gen = _launchGen;
+                _runningStation = stationNet;
+                _runningJoinOrigin = ReferenceEquals(stationNet, _net) ? _joinOrigin : JoinOrigin.Inherited;
+                _runningUserChose = _userChose;
+            }
+            var radio = _radio = Spawn(Path.Combine(_root, "radio", launch.ExeName), launch.Args, line => OnRadioLine(line, gen));
             // awdld connects to the radio's pipe; give the firmware time to boot.
             for (int i = 0; i < 100 && _wanted && State == RadioState.Starting && !radio.HasExited; i++) Thread.Sleep(100);
             if (!_wanted) return;
@@ -777,9 +809,10 @@ public sealed class Supervisor : IDisposable
         return text;
     }
 
-    void OnRadioLine(string line)
+    void OnRadioLine(string line, int generation)
     {
         Say("radio: " + line);
+        if (generation != Volatile.Read(ref _launchGen)) return;
         var text = NormalizeRadioLine(line);
         if (text.StartsWith("ready on channel", StringComparison.Ordinal))
         {
@@ -827,11 +860,11 @@ public sealed class Supervisor : IDisposable
         }
         else if (text.StartsWith("event: ", StringComparison.Ordinal))
         {
-            OnEvent(text[7..].Split(' ', 2));
+            OnEvent(text[7..].Split(' ', 2), generation);
         }
     }
 
-    void OnEvent(string[] e)
+    void OnEvent(string[] e, int generation)
     {
         var name = e[0];
         var value = e.Length > 1 ? e[1] : "";
@@ -912,8 +945,16 @@ public sealed class Supervisor : IDisposable
                 lock (_lock) _yieldUntil = DateTime.UtcNow + (value == "on" ? YieldGrace * 2 : YieldGrace);
                 break;
             case "wifi":
+                string? rescan = null;
                 lock (_lock)
                 {
+                    if (generation != _launchGen || !_wanted) break;
+                    _runningStationConnected = value == "connected";
+                    if (_wifi != value)
+                    {
+                        _stationVersion++;
+                        _stationRecorded = false;
+                    }
                     if (value == "connected")
                     {
                         _wifiDownSince = DateTime.MaxValue;
@@ -922,24 +963,28 @@ public sealed class Supervisor : IDisposable
                     }
                     else if (_wifi == "connected" || _wifiDownSince == DateTime.MaxValue) _wifiDownSince = DateTime.UtcNow;
                     _wifi = value;
+                    if (value == "failed" && _runningStation is { } failed && ReferenceEquals(failed, _net))
+                    {
+                        var now = DateTime.UtcNow;
+                        var key = (failed.Ssid, failed.Bssid.ToUpperInvariant());
+                        if (failed.Bssid != "" && (!_failedAccessPoints.TryGetValue(key, out var until) || until <= now))
+                            _failedAccessPoints[key] = now + WifiSelection.FailedApCooldown;
+                        // Let the next background scan look at other SSIDs after
+                        // an automatic attempt. A manual/Windows choice can still
+                        // look for a new BSSID for the same SSID (e.g. hotspot #27).
+                        if (_runningJoinOrigin != JoinOrigin.Automatic && !_userOff && !_scanBusy &&
+                            _pendingConnect is null && now - _scanAt > StaleScan)
+                        {
+                            _pendingConnect = (failed.Ssid, null, null, _runningJoinOrigin, true);
+                            rescan = failed.Ssid;
+                        }
+                    }
                 }
                 Publish();
-                // A failed join may be aimed at a BSSID that is gone (#27: the
-                // radio retried the old one every 5 s). If the scan it came from
-                // is old, scan for the name and rejoin with what answers now.
-                if (value == "failed")
+                if (rescan is { } retry)
                 {
-                    (string Ssid, string? Password, bool? Auto)? again = null;
-                    lock (_lock)
-                        if (_net is { } n && !_userOff && !_scanBusy && _pendingConnect is null &&
-                            DateTime.UtcNow - _scanAt > StaleScan)
-                            again = (n.Ssid, null, null);
-                    if (again is { } a)
-                    {
-                        Say($"Wi-Fi: joining \"{a.Ssid}\" failed; scanning for it again");
-                        lock (_lock) _pendingConnect = a;
-                        WifiScan(a.Ssid);
-                    }
+                    Say($"Wi-Fi: joining \"{retry}\" failed; scanning for it again");
+                    WifiScan(retry);
                 }
                 break;
             case "bss":
@@ -952,29 +997,25 @@ public sealed class Supervisor : IDisposable
                     try { ssid = System.Text.Encoding.UTF8.GetString(Convert.FromHexString(f[4])); }
                     catch (FormatException) { break; }
                     lock (_lock)
-                        _scanPending.Add(new JsonObject
-                        {
-                            ["bssid"] = f[0], ["channel"] = bch, ["dbm"] = dbm, ["security"] = f[3], ["ssid"] = ssid,
-                        });
+                        if (generation == _launchGen && _wanted)
+                            _scanPending.Add(new(ssid, f[0], bch, dbm, f[3]));
                 }
                 break;
             }
             case "scan-done":
                 lock (_lock)
                 {
-                    // One row per network name, its strongest access point. A card whose
-                    // station joins only 5 GHz (MT7902) lists 5 GHz ones only: a scan that
-                    // missed a dual-band network's 5 GHz beacon otherwise had it join the
-                    // 2.4 GHz one, which fails at once.
+                    if (generation != _launchGen || !_wanted) break;
+                    // Keep all eligible BSSIDs for retries and band selection.
+                    // The client's snapshot still shows one row per network name.
                     var on24 = _caps.StationOn24GHz;
-                    _scan = _scanPending.Where(n => on24 || ((int?)n["channel"] ?? 0) > 14)
-                        .GroupBy(n => (string?)n["ssid"] ?? "")
-                        .Select(g => g.OrderByDescending(n => (int?)n["dbm"] ?? -127).First())
-                        .OrderByDescending(n => (int?)n["dbm"] ?? -127).ToList();
+                    _scan = _scanPending.Where(ap => WifiSelection.Supports(ap, on24)).ToList();
                     _scanPending = [];
                     _scanBusy = false;
                     _mtkBackgroundScanSsid = null;
                     _scanAt = DateTime.UtcNow;
+                    foreach (var key in _failedAccessPoints.Where(p => p.Value <= _scanAt).Select(p => p.Key).ToArray())
+                        _failedAccessPoints.Remove(key);
                 }
                 Publish();
                 _ = Task.Run(AfterScan);
@@ -1029,15 +1070,40 @@ public sealed class Supervisor : IDisposable
         }
     }
 
-    void Relaunch(int channel)
+    void Relaunch(int channel, Wlan.Network? requested = null)
     {
         _launchGate.Wait();
         try
         {
+            // A queued scan result must not restart the radio after a newer
+            // manual selection, disconnect or stop superseded its target.
+            if (requested is not null)
+                lock (_lock)
+                {
+                    if (!_wanted || !ReferenceEquals(requested, _net)) return;
+                    // The old station can reconnect on its own while this
+                    // background choice is waiting for the launch gate.
+                    if (_joinOrigin == JoinOrigin.Automatic && _runningStationConnected &&
+                        _runningStation is { } recovered)
+                    {
+                        _net = recovered;
+                        _joinOrigin = _runningJoinOrigin;
+                        _userChose = _runningUserChose;
+                        _staSsid = recovered.Ssid;
+                        _wifiJoinQueued = false;
+                        return;
+                    }
+                }
             KillDaemons();
             LaunchLocked(channel);
         }
-        finally { _launchGate.Release(); }
+        finally
+        {
+            if (requested is not null)
+                lock (_lock)
+                    if (ReferenceEquals(requested, _net)) _wifiJoinQueued = false;
+            _launchGate.Release();
+        }
     }
 
     async Task Watchdog(CancellationToken ct)
@@ -1175,11 +1241,15 @@ public sealed class Supervisor : IDisposable
     async Task ProbeGateway()
     {
         bool connected, wanted;
+        Wlan.Network? station;
+        int stationVersion;
         lock (_lock)
         {
             // Not judged when the user turned Wi-Fi off or no station is set up (round 2 #11).
             wanted = EffectiveMode() == NetMode.Concurrent && State == RadioState.On && !_userOff && _staSsid != "";
             connected = wanted && _wifi == "connected";
+            station = _runningStationConnected ? _runningStation : null;
+            stationVersion = _stationVersion;
         }
         if (!wanted)
         {
@@ -1242,6 +1312,21 @@ public sealed class Supervisor : IDisposable
             _probeFails = 0;
             _gatewayAnswered = true;
             _rejoinAsked = false;
+            if (station is not null)
+                lock (_lock)
+                    if (!_stationRecorded && stationVersion == _stationVersion && _wanted && !_userOff &&
+                        _runningStationConnected && _wifi == "connected" &&
+                        ReferenceEquals(station, _net) && ReferenceEquals(station, _runningStation))
+                    {
+                        // Authentication alone is not success: DHCP/TAP and the
+                        // source-bound IPv4 gateway also have to work. Routers
+                        // that filter ICMP keep working but do not get a new rank.
+                        bool manual = ReferenceEquals(station, _pendingManualSuccess);
+                        _known.ConfirmConnection(station.Ssid, manual, DateTime.UtcNow);
+                        if (manual) _pendingManualSuccess = null;
+                        _stationRecorded = true;
+                        _failedAccessPoints.Remove((station.Ssid, station.Bssid.ToUpperInvariant()));
+                    }
             return;
         }
         if (!_gatewayAnswered) return; /* a router that drops ICMP is not judged */
@@ -1323,7 +1408,8 @@ public sealed class Supervisor : IDisposable
 
     /* ------------------------------------------------------- Wi-Fi management */
 
-    static readonly string[] Joinable = ["open", "owe", "wpa2-psk", "wpa2/3-psk", "wpa3-sae"];
+    bool IsCooling(WifiSelection.AccessPoint ap, DateTime now) =>
+        _failedAccessPoints.TryGetValue(ap.Key, out var until) && now < until;
 
     void RadioCommand(string line)
     {
@@ -1356,18 +1442,33 @@ public sealed class Supervisor : IDisposable
     }
 
     /// <summary>Joins `ssid` (from the last scan). Returns "" or why not.</summary>
-    public string WifiConnect(string ssid, string? password, bool? autoConnect, bool hidden)
+    public string WifiConnect(string ssid, string? password, bool? autoConnect, bool hidden) =>
+        WifiConnect(ssid, password, autoConnect, hidden, JoinOrigin.Manual);
+
+    string WifiConnect(string ssid, string? password, bool? autoConnect, bool hidden, JoinOrigin origin,
+                       bool retry = false, WifiSelection.AccessPoint? automaticTarget = null)
     {
         // Only Concurrent runs a station beside AirDrop. In On demand / Off the
         // relaunch below joined nothing and only restarted the radio, which
         // reset discovery each time the user tried again (#11).
         if (EffectiveMode() != NetMode.Concurrent) return "needs concurrent mode";
-        JsonObject? target;
+        WifiSelection.AccessPoint? target;
+        bool hadName;
         bool stale;
         lock (_lock)
         {
-            target = _scan.FirstOrDefault(n => (string?)n["ssid"] == ssid);
-            stale = DateTime.UtcNow - _scanAt > StaleScan;
+            var now = DateTime.UtcNow;
+            stale = now - _scanAt > StaleScan;
+            var aps = _scan.Where(ap => ap.Ssid == ssid).ToArray();
+            hadName = aps.Length != 0;
+            if (automaticTarget is not null)
+            {
+                if (stale || !aps.Contains(automaticTarget) || IsCooling(automaticTarget, now)) return "";
+                target = automaticTarget;
+            }
+            else
+                target = WifiSelection.ForName(retry ? aps.Where(ap => !IsCooling(ap, now)) : aps,
+                                               _known.SelectionProfile(ssid), password);
         }
         // An iPhone hotspot comes back with a new BSSID: joining the address
         // from an old scan sent every authentication into the void until a later
@@ -1375,26 +1476,28 @@ public sealed class Supervisor : IDisposable
         var isHidden = hidden || _known.Find(ssid)?.Hidden == true;
         if (target is not null && stale && !_scanBusy && State == RadioState.On)
         {
-            lock (_lock) _pendingConnect = (ssid, password, autoConnect);
+            lock (_lock) _pendingConnect = (ssid, password, autoConnect, origin, retry);
             WifiScan(ssid);
             return "";
         }
         if (target is null)
         {
+            if (hadName)
+                return retry ? "no compatible access point ready to retry yet" : "no compatible access point for this network";
             if (_scanBusy)
             {
                 if (!isHidden) return "still scanning; try again in a moment";
                 // Queue directed scan after the active wildcard scan finishes (#50).
-                lock (_lock) _pendingConnect = (ssid, password, autoConnect);
+                lock (_lock) _pendingConnect = (ssid, password, autoConnect, origin, retry);
                 return "";
             }
             // Not in the list (hidden, or out of the last scan): look for it by name first.
-            lock (_lock) _pendingConnect = (ssid, password, autoConnect);
+            lock (_lock) _pendingConnect = (ssid, password, autoConnect, origin, retry);
             WifiScan(ssid);
             return "";
         }
-        var security = (string?)target["security"] ?? "";
-        if (!Joinable.Contains(security))
+        var security = target.Security;
+        if (!WifiSelection.IsJoinable(security))
             return security switch
             {
                 "802.1x" => "enterprise (802.1X) networks are not supported yet",
@@ -1402,7 +1505,7 @@ public sealed class Supervisor : IDisposable
                 _ => "this network's security is not supported",
             };
         // Enhanced Open (OWE) has no password: the radio sees it in the beacon and encrypts.
-        var open = security is "open" or "owe";
+        var open = WifiSelection.IsOpen(security);
         string? pass = null, psk = null;
         if (!open)
         {
@@ -1421,18 +1524,30 @@ public sealed class Supervisor : IDisposable
             // SAE works from the password itself; a stored 64-digit key cannot do WPA3.
             if (security == "wpa3-sae" && pass is null) return "WPA3 needs the Wi-Fi password itself, not a 64-digit key";
         }
-        _known.Remember(ssid, pass, psk, open, autoConnect, hidden: hidden ? true : null);
-        var net = new Wlan.Network(ssid, (string?)target["bssid"] ?? "", (int?)target["channel"] ?? 0, security, pass, psk, open);
+        var net = new Wlan.Network(ssid, target.Bssid, target.Channel, security, pass, psk, open);
         lock (_lock)
         {
+            if (origin == JoinOrigin.Automatic &&
+                (!CanAutoJoin() || !_scan.Contains(target) || IsCooling(target, DateTime.UtcNow) ||
+                 _known.SelectionProfile(ssid) is not { AutoConnect: true })) return "";
+            if (origin != JoinOrigin.Automatic)
+            {
+                _known.Remember(ssid, pass, psk, open, autoConnect, hidden: hidden ? true : null);
+                bool awaitManualSuccess = origin == JoinOrigin.Manual &&
+                    (!retry || _pendingManualSuccess is not null && ReferenceEquals(_pendingManualSuccess, _net));
+                _pendingManualSuccess = awaitManualSuccess ? net : null;
+            }
             _net = net;
+            _joinOrigin = origin;
+            _wifiJoinQueued = true;
+            _pendingConnect = null;
             _userChose = true;
             _userOff = false;
             _wifiError = "";
             _staSsid = ssid;
         }
-        Say($"Wi-Fi: joining \"{ssid}\" (chosen in nekodrop)");
-        _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel));
+        Say($"Wi-Fi: joining \"{ssid}\" ({(origin == JoinOrigin.Automatic ? "auto-connect" : origin == JoinOrigin.Manual ? "chosen in nekodrop" : "inherited from Windows")}, channel {net.Channel})");
+        _ = Task.Run(() => Relaunch(_channel == 0 ? _cfg.StartChannel : _channel, net));
         return "";
     }
 
@@ -1443,6 +1558,9 @@ public sealed class Supervisor : IDisposable
             _userOff = true;
             _userChose = false;
             _net = null;
+            _pendingManualSuccess = null;
+            _wifiJoinQueued = false;
+            _pendingConnect = null;
             _staSsid = "";
             _wifi = "";
         }
@@ -1465,10 +1583,13 @@ public sealed class Supervisor : IDisposable
         Publish();
     }
 
+    bool CanAutoJoin() => _wanted && State == RadioState.On && !_userOff && _wifi != "connected" &&
+                          !_wifiJoinQueued && _pendingConnect is null && EffectiveMode() == NetMode.Concurrent;
+
     /// <summary>After a scan: a pending connect by name, or auto-connect when Wi-Fi is down.</summary>
     void AfterScan()
     {
-        (string Ssid, string? Password, bool? Auto)? pending;
+        (string Ssid, string? Password, bool? Auto, JoinOrigin Origin, bool Retry)? pending;
         lock (_lock)
         {
             pending = _pendingConnect;
@@ -1477,7 +1598,7 @@ public sealed class Supervisor : IDisposable
         if (pending is { } pc)
         {
             bool found;
-            lock (_lock) found = _scan.Any(n => (string?)n["ssid"] == pc.Ssid);
+            lock (_lock) found = _scan.Any(ap => ap.Ssid == pc.Ssid);
             // A scan hears a DFS channel's access point only by its beacons, and
             // one scan in three missed the MT7902's 5 GHz one: look twice more.
             if (!found && _pendingScans < 2)
@@ -1488,12 +1609,13 @@ public sealed class Supervisor : IDisposable
                 return;
             }
             _pendingScans = 0;
-            var why = found ? WifiConnect(pc.Ssid, pc.Password, pc.Auto, false) : $"\"{pc.Ssid}\" was not found";
+            var why = found ? WifiConnect(pc.Ssid, pc.Password, pc.Auto, false, pc.Origin, pc.Retry)
+                            : $"\"{pc.Ssid}\" was not found";
             if (why != "") lock (_lock) _wifiError = why;
             Publish();
             return;
         }
-        if (_userOff || EffectiveMode() != NetMode.Concurrent || _wifi == "connected") return;
+        lock (_lock) if (!CanAutoJoin()) return;
         // Auto-join can restart the radio. Don't do that to an AirDrop transfer
         // that started during the scan's home windows (#54/#56).
         if (_profile.Backend == RadioBackendKind.MtkRadio &&
@@ -1501,16 +1623,19 @@ public sealed class Supervisor : IDisposable
         if (DateTime.UtcNow - _wifiDownSince < TimeSpan.FromSeconds(20)) return;
         // Beside a wired connection Wi-Fi is joined only from the Wi-Fi window (issue #1).
         if (Wlan.WiredUp()) return;
-        JsonObject? best;
+        WifiSelection.AccessPoint? best;
         lock (_lock)
-            best = _scan.Where(n => Joinable.Contains((string?)n["security"] ?? "") &&
-                                    _known.Find((string?)n["ssid"] ?? "") is { HasKey: true, AutoConnect: true })
-                        .OrderByDescending(n => (int?)n["dbm"] ?? -127).FirstOrDefault();
+        {
+            if (!CanAutoJoin()) return;
+            var now = DateTime.UtcNow;
+            best = WifiSelection.Automatic(_scan, _known.SelectionProfile, ap => IsCooling(ap, now));
+        }
         if (best is null)
         {
             string? nextHidden = null;
             lock (_lock)
             {
+                if (!CanAutoJoin()) return;
                 nextHidden = _known.All()
                     .FirstOrDefault(k => k is { HasKey: true, AutoConnect: true, Hidden: true } && !_hiddenProbed.Contains(k.Ssid))
                     ?.Ssid;
@@ -1519,9 +1644,7 @@ public sealed class Supervisor : IDisposable
             if (nextHidden is not null) WifiScan(nextHidden, background: true);
             return;
         }
-        var ssid = (string?)best["ssid"] ?? "";
-        Say($"Wi-Fi: auto-connecting to \"{ssid}\"");
-        WifiConnect(ssid, null, null, false);
+        WifiConnect(best.Ssid, null, null, false, JoinOrigin.Automatic, automaticTarget: best);
     }
 
     /// <summary>
