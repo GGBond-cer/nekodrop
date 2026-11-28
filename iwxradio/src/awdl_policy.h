@@ -496,6 +496,19 @@ constexpr unsigned kBaTxAskMax = 20;
 constexpr uint64_t kBaTxAskTimeoutUS = 5000000;
 constexpr uint64_t kBaTxFailBackoffUS = 60000000;
 
+/* A card whose firmware never reports Block Acks (#39, AX210 family) used to
+ * stop asking until the radio restarted. That also punished the case where the
+ * first stall was transient: a channel change, a peer that rejoined or a
+ * different peer can make aggregation work later in the same session. After the
+ * second stall, back off for five minutes instead of forever, and let a session
+ * that really produced Block Acks clear the count (radio_main.cpp resets it when
+ * it ends its own session after a finished bulk send). */
+constexpr uint32_t kBaTxStallLimit = 2;
+constexpr uint64_t kBaTxLongBackoffUS = 300000000;
+inline uint64_t ba_tx_retry_us(uint32_t stalls, uint64_t now_us) {
+  return now_us + (stalls >= kBaTxStallLimit ? kBaTxLongBackoffUS : kBaTxFailBackoffUS);
+}
+
 /* Experimental A-MPDU send fallback (#4): if the peer agreed and we have fed at
  * least two full 64-frame Block Ack windows with zero Block Ack notifications
  * and >= 64 single-frame completions, the firmware is not aggregating on this
