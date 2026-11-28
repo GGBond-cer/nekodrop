@@ -652,6 +652,9 @@ Step 'firewall: AirDrop (link-local), Android Share and LocalSend (local subnet)
   # LocalSend (protocol v2): HTTPS server and multicast discovery on 53317.
   New-NetFirewallRule @lan -DisplayName 'nekodrop LocalSend' -Protocol TCP -LocalPort 53317 | Out-Null
   New-NetFirewallRule @lan -DisplayName 'nekodrop LocalSend discovery' -Protocol UDP -LocalPort 53317 | Out-Null
+  # Quick Share stays opt-in in the UI; the worker binds only a local IPv4 interface.
+  New-NetFirewallRule @lan -DisplayName 'nekodrop Quick Share' -Protocol TCP -LocalPort 53318 | Out-Null
+  New-NetFirewallRule @lan -DisplayName 'nekodrop Quick Share discovery' -Protocol UDP -LocalPort 5353 | Out-Null
 }
 
 'Service'

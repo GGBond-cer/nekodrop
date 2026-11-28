@@ -43,6 +43,7 @@ public partial class SettingsWindow : Window
         AppleIdOn_Changed(AppleIdOnBox, new RoutedEventArgs());
         MtaOnBox.IsChecked = s.MtaOn;
         LocalSendOnBox.IsChecked = s.LocalSendOn;
+        QuickShareOnBox.IsChecked = s.QuickShareOn;
         MtaRelayBox.IsChecked = s.RelayOn;
         MtaRelayKeepLocalBox.IsChecked = s.MtaRelayKeepLocal;
         _relayRules = Relay.Load(s.RelayRules);
@@ -347,6 +348,7 @@ public partial class SettingsWindow : Window
         s.Receive = receive;
         s.MtaOn = MtaOnBox.IsChecked == true;
         s.LocalSendOn = LocalSendOnBox.IsChecked == true;
+        s.QuickShareOn = QuickShareOnBox.IsChecked == true;
         s.RelayOn = MtaRelayBox.IsChecked == true;
         s.RelayRules = Relay.Save(_relayRules);
         s.MtaRelayKeepLocal = MtaRelayKeepLocalBox.IsChecked == true;

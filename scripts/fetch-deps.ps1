@@ -30,6 +30,7 @@ Get-Repo winawdl https://github.com/raph559/winawdl.git 0db7031589dc2bca03c0893d
 Get-Repo 'winawdl\upstream\devourer' https://github.com/raph559/devourer.git 8d936de2a3805ce126e5236349afe40e645aaf9b
 Get-Repo ForbiddenItlwm https://github.com/retropineaple/ForbiddenItlwm.git 96ff71e0211789239f6fbf6b64ac8e7fd22b41aa
 Get-Repo WirDrop https://github.com/JungyoKim/WirDrop.git 7c5308ca7fb9ee3d375e4c4ca93f7f9d6a7542a6
+Get-Repo quickshare-cli https://github.com/adityatelange/quickshare-cli-py.git 891c73b88720587470cec602bfe5a9cc321ef25a
 
 # Bz-hr firmware for the AX203 on Arrow Lake (8086:7740), which ForbiddenItlwm
 # does not carry: iwlwifi-bz-b0-hr-b0-100 (core 97, the newest for this RF; the

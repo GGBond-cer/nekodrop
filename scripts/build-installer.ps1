@@ -165,6 +165,7 @@ if (Test-Path $py) {
   # there, since its modules import each other.
   $pth = Get-ChildItem "$stage\python" -Filter 'python*._pth' | Select-Object -First 1
   Add-Content $pth.FullName '..\airdrop'
+  & "$PSScriptRoot\stage-quickshare.ps1" -Stage $stage -Downloads $downloads -Offline:$Offline
 } else { '  (no Python embeddable: the client falls back to a Python on PATH)' }
 if (Test-Path $tap) {
   $sig = Get-AuthenticodeSignature $tap

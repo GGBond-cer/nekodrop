@@ -325,6 +325,17 @@
           <Border Style="{StaticResource CardPad}">
             <StackPanel>
               <DockPanel>
+                <CheckBox x:Name="QuickShareOnBox" DockPanel.Dock="Right" Style="{StaticResource WinToggle}" Margin="12,0,0,0"/>
+                <StackPanel>
+                  <TextBlock Text="{local:T qs.on}" Style="{StaticResource T13S}" TextWrapping="Wrap"/>
+                  <TextBlock Text="{local:T qs.hint}" Style="{StaticResource Sub12}" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                </StackPanel>
+              </DockPanel>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource CardPad}">
+            <StackPanel>
+              <DockPanel>
                 <CheckBox x:Name="MtaRelayBox" DockPanel.Dock="Right" Style="{StaticResource WinToggle}" Margin="12,0,0,0"
                           Checked="MtaRelay_Changed" Unchecked="MtaRelay_Changed"/>
                 <StackPanel>

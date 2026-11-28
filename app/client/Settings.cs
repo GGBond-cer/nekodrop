@@ -60,6 +60,8 @@ public sealed class Settings
     public bool MtaOn { get; set; }
     /// <summary>Experimental LocalSend (protocol v2) on the local network; off by default.</summary>
     public bool LocalSendOn { get; set; }
+    /// <summary>Experimental Google Quick Share on the same IPv4 LAN; off by default.</summary>
+    public bool QuickShareOn { get; set; }
     /// <summary>
     /// Experimental relay: rules "files from device X go on to device Y"
     /// (Relay, RelayRule); everyone else's transfers are received as usual.

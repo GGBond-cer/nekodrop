@@ -70,6 +70,7 @@ public sealed class App : Application
     public Engine Engine { get; } = new();
     public MtaEngine Mta { get; } = new();
     public LocalSendEngine LocalSend { get; } = new();
+    public QuickShareEngine QuickShare { get; } = new();
     readonly Wake _wake = new();
     Forms.NotifyIcon? _tray;
     MainWindow? _window;
@@ -85,7 +86,8 @@ public sealed class App : Application
     /// <summary>Active AirDrop send/receive IDs; while non-empty, MTA BLE active scanning yields to AWDL.</summary>
     readonly HashSet<string> _airDropActive = new(StringComparer.Ordinal);
 
-    static bool IsAirDropRequestId(string id) => !MtaEngine.IsMtaRequest(id) && !LocalSendEngine.IsRequest(id);
+    static bool IsAirDropRequestId(string id) => !MtaEngine.IsMtaRequest(id) && !LocalSendEngine.IsRequest(id) &&
+                                                  !QuickShareEngine.IsRequest(id);
 
     void SyncMtaRadioYield()
     {
@@ -201,6 +203,9 @@ public sealed class App : Application
             EngineLog(o.ToJsonString());
         };
         LocalSend.Log += EngineLog;
+        QuickShare.Event += o => Dispatcher.BeginInvoke(() => OnEngine(o));
+        QuickShare.Log += EngineLog;
+        System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged += OnQuickShareNetworkChanged;
         Model.LocalSendOn = Settings.LocalSendOn;
         Mta.IncomingHandshake += () => Dispatcher.BeginInvoke(() =>
         {
@@ -210,6 +215,7 @@ public sealed class App : Application
         });
         Mta.Apply(Settings);
         LocalSend.Apply(Settings);
+        QuickShare.Apply(Settings);
         if (Settings.Discoverable) StartEngine();
         _wake.AirDropNearby += () => Dispatcher.BeginInvoke(() =>
         {
@@ -638,6 +644,7 @@ public sealed class App : Application
         Engine.Look(true);
         Mta.Look(true);
         LocalSend.Look(true);
+        QuickShare.Look(true);
     }
 
     ResourceDictionary? _styles;
@@ -809,7 +816,12 @@ public sealed class App : Application
         Model.LocalSendOn = Settings.LocalSendOn;
         LocalSend.Apply(Settings);
         if (Settings.LocalSendOn && (_send is not null || _window is { IsVisible: true })) LocalSend.Look(true);
+        QuickShare.Apply(Settings);
+        if (Settings.QuickShareOn && (_send is not null || _window is { IsVisible: true })) QuickShare.Look(true);
     }
+
+    void OnQuickShareNetworkChanged(object? sender, EventArgs e) =>
+        Dispatcher.BeginInvoke(() => QuickShare.Apply(Settings));
 
     public void SetRelay(bool on)
     {
@@ -849,6 +861,7 @@ public sealed class App : Application
         Engine.Look(true);
         Mta.Look(true);
         LocalSend.Look(true);
+        QuickShare.Look(true);
     }
 
     public void WindowClosed() { if (_send is null) StopLookingLater(); }
@@ -873,6 +886,7 @@ public sealed class App : Application
             Engine.Look(false);
             Mta.Look(false);
             LocalSend.Look(false);
+            QuickShare.Look(false);
         };
         _lookTimer.Start();
     }
@@ -882,6 +896,8 @@ public sealed class App : Application
         _wake.Dispose();
         Mta.Dispose();
         LocalSend.Dispose();
+        System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged -= OnQuickShareNetworkChanged;
+        QuickShare.Dispose();
         Engine.Dispose();
         Service.Dispose();
         if (_tray is not null) _tray.Visible = false;
@@ -946,7 +962,7 @@ public sealed class App : Application
             case "answer":
                 var id = q["id"] ?? "";
                 var accept = q["accept"] == "1";
-                if (accept && q["always"] == "1" && _requests.TryGetValue(id, out var req))
+                if (accept && q["always"] == "1" && !QuickShareEngine.IsRequest(id) && _requests.TryGetValue(id, out var req))
                 {
                     var key = $"{req.Sender}|{req.Model}";
                     if (!Settings.AlwaysAccept.Contains(key))
@@ -1055,6 +1071,7 @@ public sealed class App : Application
     {
         if (MtaEngine.IsMtaRequest(id)) Mta.Answer(id, accept);
         else if (LocalSendEngine.IsRequest(id)) LocalSend.Answer(id, accept);
+        else if (QuickShareEngine.IsRequest(id)) QuickShare.Answer(id, accept);
         else
         {
             if (accept) _airDropActive.Add(id);
@@ -1076,7 +1093,8 @@ public sealed class App : Application
     /// </summary>
     void AttachAsk(Request r)
     {
-        var protocol = MtaEngine.IsMtaRequest(r.Id) ? "mta2" : LocalSendEngine.IsRequest(r.Id) ? LocalSendEngine.ProtocolName : "airdrop";
+        var protocol = MtaEngine.IsMtaRequest(r.Id) ? "mta2" : LocalSendEngine.IsRequest(r.Id) ? LocalSendEngine.ProtocolName :
+                       QuickShareEngine.IsRequest(r.Id) ? QuickShareEngine.Protocol : "airdrop";
         var d = Model.Devices.FirstOrDefault(x => x.Protocol == protocol && string.Equals(x.Name, r.Sender, StringComparison.OrdinalIgnoreCase) && x.Ask is null);
         if (d is null) Model.Devices.Add(d = new Device { Id = "ask:" + r.Id, Name = r.Sender, Model = r.Model, Protocol = protocol, ForAsk = true });
         d.Ask = r;
@@ -1099,6 +1117,7 @@ public sealed class App : Application
         {
             if (MtaEngine.IsMtaRequest(rx.Id)) Mta.Cancel(rx.Id);
             else if (LocalSendEngine.IsRequest(rx.Id)) LocalSend.Cancel(rx.Id);
+            else if (QuickShareEngine.IsRequest(rx.Id)) QuickShare.Cancel(rx.Id);
             else Engine.Cancel(rx.Id);
             return;
         }
@@ -1107,6 +1126,7 @@ public sealed class App : Application
             if (info.DeviceId != d.Id) continue;
             if (MtaEngine.IsMtaPeer(d.Id)) Mta.Cancel(sendId);
             else if (LocalSendEngine.IsPeer(d.Id)) LocalSend.Cancel(sendId);
+            else if (QuickShareEngine.IsPeer(d.Id)) QuickShare.Cancel(sendId);
             else Engine.Cancel(sendId);
             break;
         }
@@ -1136,6 +1156,7 @@ public sealed class App : Application
         Service.Touch();
         if (MtaEngine.IsMtaPeer(d.Id)) Mta.SendFiles(id, d.Id, files);
         else if (LocalSendEngine.IsPeer(d.Id)) LocalSend.SendFiles(id, d.Id, files);
+        else if (QuickShareEngine.IsPeer(d.Id)) QuickShare.SendFiles(id, d.Id, files);
         else Engine.SendFiles(id, d.Id, files);
     }
 
@@ -1261,6 +1282,20 @@ public sealed class App : Application
         var id = (string?)o["id"] ?? "";
         switch (ev)
         {
+            case "qs-stopped":
+                foreach (var req in _requests.Keys.Where(QuickShareEngine.IsRequest).ToArray())
+                    OnEngine(new() { ["event"] = "lost", ["id"] = req, ["reason"] = "cancelled" });
+                foreach (var tx in _sendInfo.Where(pair => QuickShareEngine.IsPeer(pair.Value.DeviceId)).Select(pair => pair.Key).ToArray())
+                    OnEngine(new() { ["event"] = "send", ["id"] = tx, ["state"] = "cancelled" });
+                foreach (var qs in Model.Devices.Where(d => d.Protocol == QuickShareEngine.Protocol).ToList())
+                    Model.Devices.Remove(qs);
+                break;
+            case "pin":
+                if (_sendInfo.TryGetValue(id, out var pending) && QuickShareEngine.IsPeer(pending.DeviceId) &&
+                    (string?)o["pin"] is { Length: 4 } code && code.All(char.IsAsciiDigit) &&
+                    Model.Devices.FirstOrDefault(d => d.Id == pending.DeviceId) is { } waiting)
+                    waiting.Status = L.F("qs.pin", code);
+                break;
             case "ready":
                 /* A new engine (the watchdog starts one over when the radio
                  * moves channel and re-creates awdl0) knows no peers and is not
@@ -1290,6 +1325,7 @@ public sealed class App : Application
             case "asked":
             {
                 Service.Touch();
+                var isQuickShare = QuickShareEngine.IsRequest(id);
                 var sender = (string?)o["sender"] ?? L.T("dev.someone");
                 var model = (string?)o["model"] ?? "";
                 var files = o["files"] as JsonArray;
@@ -1299,11 +1335,17 @@ public sealed class App : Application
                 var isContact = (bool?)o["contact"] == true;
                 var preview = MediaHelper.PrepareToastPreview((string?)o["icon"]);
                 var what = Describe(files, linkCount, urls);
+                if (isQuickShare)
+                {
+                    if ((string?)o["pin"] is not { Length: 4 } pin || !pin.All(char.IsAsciiDigit))
+                    { QuickShare.Answer(id, false); break; }
+                    what += " · " + L.F("qs.pin", pin);
+                }
                 _askSender[id] = sender;
                 if (!string.IsNullOrEmpty(preview)) _askIcon[id] = preview;
                 var key = $"{sender}|{model}";
                 // Remembered for Settings > Always accept from > Add (#45).
-                if (Settings.RecentSenders.FirstOrDefault() != key)
+                if (!isQuickShare && Settings.RecentSenders.FirstOrDefault() != key)
                 {
                     Settings.RecentSenders.Remove(key);
                     Settings.RecentSenders.Insert(0, key);
@@ -1311,17 +1353,17 @@ public sealed class App : Application
                     Settings.Save();
                 }
                 /* Relay: only the two chosen devices; anyone else is a normal receive. */
-                var relayTo = Relay.TargetFor(WorkingRelayRules, Relay.ProtocolOf(id), (string?)o["peer"], sender);
+                var relayTo = isQuickShare ? null : Relay.TargetFor(WorkingRelayRules, Relay.ProtocolOf(id), (string?)o["peer"], sender);
                 if (relayTo is not null)
                 {
                     _relayTo[id] = relayTo;
                     EngineLog($"relay: a rule sends {sender}'s files on to {relayTo.Label}");
                 }
-                var autoAccept = !waits ||
+                var autoAccept = !isQuickShare && (!waits ||
                                  relayTo is not null ||
                                  Settings.AutoAcceptMode == "everyone" ||
                                  (Settings.AutoAcceptMode == "contacts" && isContact) ||
-                                 Settings.AlwaysAccept.Contains(key);
+                                 Settings.AlwaysAccept.Contains(key));
                 var r = new Request
                 {
                     Id = id,
@@ -1348,7 +1390,7 @@ public sealed class App : Application
                 }
                 else
                 {
-                    Shell.AskToast(id, sender, what, preview);
+                    Shell.AskToast(id, sender, what, preview, allowAlways: !isQuickShare);
                 }
                 break;
             }
@@ -1452,7 +1494,8 @@ public sealed class App : Application
                 var reason = (string?)o["reason"] ?? "";
                 if (state == "failed" && string.Equals(reason, "cancelled", StringComparison.OrdinalIgnoreCase))
                     state = "cancelled";
-                var isAirDropSend = !MtaEngine.IsMtaPeer(info.DeviceId) && !LocalSendEngine.IsPeer(info.DeviceId);
+                var isAirDropSend = !MtaEngine.IsMtaPeer(info.DeviceId) && !LocalSendEngine.IsPeer(info.DeviceId) &&
+                                    !QuickShareEngine.IsPeer(info.DeviceId);
                 if (isAirDropSend && state is "sending" or "finishing" && _airDropActive.Add(id))
                     SyncMtaRadioYield();
                 var failure = state == "failed" ? SendRules.FailureStatus(reason, info.Files) : "";

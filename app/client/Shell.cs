@@ -165,23 +165,24 @@ public static class Shell
     }
 
     /// <summary>"iPhone 想发送 2 张照片" with optional FileIcon hero preview and 接受 / 总是接受 / 拒绝.</summary>
-    public static void AskToast(string id, string sender, string what, string? heroImagePath = null)
+    public static void AskToast(string id, string sender, string what, string? heroImagePath = null, bool allowAlways = true)
     {
         var accept = X($"nekodrop:answer?id={Uri.EscapeDataString(id)}&accept=1");
         var always = X($"nekodrop:answer?id={Uri.EscapeDataString(id)}&accept=1&always=1");
         var decline = X($"nekodrop:answer?id={Uri.EscapeDataString(id)}&accept=0");
+        var alwaysAction = allowAlways ? $"<action content=\"{X(L.T("accept.always"))}\" arguments=\"{always}\" activationType=\"protocol\"/>" : "";
         var heroXml = "";
         if (!string.IsNullOrEmpty(heroImagePath) && File.Exists(heroImagePath) && MediaHelper.IsToastPreviewable(heroImagePath))
             heroXml = $"\n                <image placement=\"hero\" src=\"{X(new Uri(heroImagePath).AbsoluteUri)}\"/>";
         Show($"""
             <toast scenario="reminder" launch="{X("nekodrop:open")}" activationType="protocol">
               <visual><binding template="ToastGeneric">
-                <text>{X(L.F("ask.title", sender))}</text>
+                <text>{X(L.F(allowAlways ? "ask.title" : "qs.ask", sender))}</text>
                 <text>{X(what)}</text>{heroXml}
               </binding></visual>
               <actions>
                 <action content="{X(L.T("accept"))}" arguments="{accept}" activationType="protocol"/>
-                <action content="{X(L.T("accept.always"))}" arguments="{always}" activationType="protocol"/>
+                {alwaysAction}
                 <action content="{X(L.T("decline"))}" arguments="{decline}" activationType="protocol"/>
               </actions>
             </toast>
