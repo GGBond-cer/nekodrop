@@ -106,7 +106,13 @@ public static class Theme
             ["DropWell"] = B(card),
             ["Caution"] = B(colourful ? amber : text2),
             ["Critical"] = B(error),
-            ["UiFont"] = new FontFamily("Segoe UI Variable Text, Segoe UI, Microsoft YaHei UI"),
+            ["UiFont"] = new FontFamily("Segoe UI Variable Text, Segoe UI, " + (L.Code switch
+            {
+                "zh-Hant" => "Microsoft JhengHei UI",
+                "ja" => "Yu Gothic UI, Meiryo UI",
+                "ko" => "Malgun Gothic",
+                _ => "Microsoft YaHei UI",
+            })),
             ["IconFont"] = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"),
         };
     }

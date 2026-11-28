@@ -29,15 +29,33 @@ static std::wstring folder()
 
 static std::wstring exe() { return folder() + L"\\nekodrop.exe"; }
 
-// The client's language choice (HKCU\Software\nekodrop, Language = zh | en),
-// else the Windows display language.
-static bool chinese()
+// The running client writes the same localized label used by the classic
+// verb. Before first launch (or during an update), retain a Windows fallback.
+static HRESULT menu_title(LPWSTR *name)
 {
+    wchar_t label[96] = {};
+    DWORD labelSize = sizeof label;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\nekodrop", L"SendMenuTitle",
+                     RRF_RT_REG_SZ, nullptr, label, &labelSize) == ERROR_SUCCESS && label[0])
+        return SHStrDupW(label, name);
     wchar_t v[8] = {};
     DWORD size = sizeof v;
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\nekodrop", L"Language", RRF_RT_REG_SZ, nullptr, v, &size) == ERROR_SUCCESS)
-        return v[0] == L'z';
-    return PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_CHINESE;
+    {
+        if (lstrcmpW(v, L"zh") == 0) return SHStrDupW(L"用 nekodrop 发送", name);
+        if (lstrcmpW(v, L"en") == 0) return SHStrDupW(L"Send with nekodrop", name);
+    }
+    LANGID lang = GetUserDefaultUILanguage();
+    switch (PRIMARYLANGID(lang))
+    {
+        case LANG_CHINESE: return SHStrDupW(SUBLANGID(lang) == SUBLANG_CHINESE_SIMPLIFIED ||
+            SUBLANGID(lang) == SUBLANG_CHINESE_SINGAPORE ? L"用 nekodrop 发送" : L"使用 nekodrop 傳送", name);
+        case LANG_FRENCH: return SHStrDupW(L"Envoyer avec nekodrop", name);
+        case LANG_SPANISH: return SHStrDupW(L"Enviar con nekodrop", name);
+        case LANG_KOREAN: return SHStrDupW(L"nekodrop으로 보내기", name);
+        case LANG_JAPANESE: return SHStrDupW(L"nekodropで送信", name);
+        default: return SHStrDupW(L"Send with nekodrop", name);
+    }
 }
 
 static void quote(std::wstring &cmd, const std::wstring &arg)
@@ -83,7 +101,7 @@ public:
 
     IFACEMETHODIMP GetTitle(IShellItemArray *, LPWSTR *name) override
     {
-        return SHStrDupW(chinese() ? L"用 nekodrop 发送" : L"Send with nekodrop", name);
+        return menu_title(name);
     }
     IFACEMETHODIMP GetIcon(IShellItemArray *, LPWSTR *icon) override
     {

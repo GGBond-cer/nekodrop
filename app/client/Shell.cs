@@ -50,7 +50,8 @@ public static class Shell
         Try(() =>
         {
             using var app = Registry.CurrentUser.CreateSubKey(@"Software\nekodrop");
-            app.SetValue("Language", L.Zh ? "zh" : "en");
+            app.SetValue("Language", L.Code);
+            app.SetValue("SendMenuTitle", L.T("verb"));
         });
         Try(() =>
         {

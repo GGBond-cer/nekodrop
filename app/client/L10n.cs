@@ -1,31 +1,89 @@
 // SPDX-License-Identifier: GPL-2.0-only
 using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Windows.Markup;
 
 namespace NekoDrop;
 
 /// <summary>
-/// Chinese and English. The language follows Windows (zh-* gets Chinese,
-/// anything else English) unless Settings.Language picks one. XAML uses
+/// The language follows the Windows display language unless Settings.Language
+/// picks one. English is the fallback for unsupported locales or keys. XAML uses
 /// {local:T key}; code uses L.T("key") or L.F("key", args).
 /// </summary>
 public static class L
 {
-    public static bool Zh { get; private set; } = Detect("auto");
-
-    static bool Detect(string choice) => choice switch
+    static readonly Dictionary<string, string> Cultures = new(StringComparer.Ordinal)
     {
-        "zh" => true,
-        "en" => false,
-        _ => CultureInfo.CurrentUICulture.Name.StartsWith("zh", StringComparison.OrdinalIgnoreCase),
+        ["en"] = "en-US", ["zh"] = "zh-CN", ["zh-Hant"] = "zh-TW", ["fr"] = "fr-FR",
+        ["es"] = "es-ES", ["ko"] = "ko-KR", ["ja"] = "ja-JP",
     };
 
-    public static void Use(string choice) => Zh = Detect(choice);
+    static readonly Dictionary<string, Lazy<Dictionary<string, string>>> Packs = new[] { "zh-Hant", "fr", "es", "ko", "ja" }
+        .ToDictionary(code => code, code => new Lazy<Dictionary<string, string>>(() => Load(code)), StringComparer.Ordinal);
 
-    public static string T(string key) =>
-        Strings.TryGetValue(key, out var s) ? (Zh ? s.Zh : s.En) : key;
+    public static string Code { get; private set; } = Detect("auto", CultureInfo.CurrentUICulture.Name);
+    public static CultureInfo FormatCulture => CultureInfo.GetCultureInfo(Cultures[Code]);
 
-    public static string F(string key, params object[] args) => string.Format(T(key), args);
+    static string Detect(string choice, string windowsCulture)
+    {
+        if (Cultures.ContainsKey(choice)) return choice;
+        var parts = windowsCulture.Split('-').Select(part => part.ToLowerInvariant()).ToArray();
+        return parts[0] switch
+        {
+            "zh" => parts.Any(part => part is "hant" or "tw" or "hk" or "mo") ? "zh-Hant" : "zh",
+            "fr" => "fr", "es" => "es", "ko" => "ko", "ja" => "ja", _ => "en",
+        };
+    }
+
+    public static void Use(string choice) => Code = Detect(choice, CultureInfo.CurrentUICulture.Name);
+
+    static Dictionary<string, string> Load(string code)
+    {
+        using var source = typeof(L).Assembly.GetManifestResourceStream($"NekoDrop.Locales.{code}.json");
+        return source is null ? new() : JsonSerializer.Deserialize<Dictionary<string, string>>(source) ?? new();
+    }
+
+    public static string T(string key)
+    {
+        if (Packs.TryGetValue(Code, out var pack) && pack.Value.TryGetValue(key, out var localized)) return localized;
+        return Strings.TryGetValue(key, out var s) ? (Code == "zh" ? s.Zh : s.En) : key;
+    }
+
+    public static string F(string key, params object[] args) => string.Format(FormatCulture, T(key), args);
+
+    internal static int SelfTest()
+    {
+        int failures = 0;
+        void Fail(string why) { Console.Error.WriteLine("FAIL " + why); failures++; }
+        static IEnumerable<string> Placeholders(string text) => Regex.Matches(text, @"\{\d+(?:,[^}:]+)?(?::[^}]+)?\}")
+            .Select(m => m.Value).Order(StringComparer.Ordinal);
+        foreach (var (input, want) in new[] { ("zh-CN", "zh"), ("zh-TW", "zh-Hant"), ("zh-Hans", "zh"),
+            ("zh-HK", "zh-Hant"), ("zh-Hant", "zh-Hant"), ("zh-MO", "zh-Hant"),
+            ("fr-CA", "fr"), ("es-MX", "es"), ("ko-KR", "ko"), ("ja-JP", "ja"), ("de-DE", "en") })
+            if (Detect("auto", input) != want) Fail($"incorrect auto locale for {input}");
+        foreach (var (code, pack) in Packs)
+        {
+            if (Detect(code, "de-DE") != code) Fail($"explicit locale {code} was not applied");
+            var translated = pack.Value;
+            foreach (var (key, source) in Strings)
+            {
+                var original = code == "zh-Hant" ? source.Zh : source.En;
+                if (!translated.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+                { Fail($"{code}: missing {key}"); continue; }
+                if (!Placeholders(value).SequenceEqual(Placeholders(original)))
+                    Fail($"{code}: incompatible placeholders in {key}");
+                if (original.Contains('{'))
+                    try { _ = CompositeFormat.Parse(value); }
+                    catch (FormatException) { Fail($"{code}: invalid format in {key}"); }
+            }
+            foreach (var key in translated.Keys)
+                if (!Strings.ContainsKey(key)) Fail($"{code}: unknown key {key}");
+        }
+        if (failures == 0) Console.WriteLine($"Localization self-test passed ({Cultures.Count} languages, {Strings.Count} UI strings).");
+        return failures == 0 ? 0 : 1;
+    }
 
     static readonly Dictionary<string, (string Zh, string En)> Strings = new()
     {
@@ -475,6 +533,11 @@ public static class L
         ["ls.err.pin"] = ("对方要求输入 PIN 码，目前还不支持", "The receiver asks for a PIN, which is not supported yet"),
         ["ls.err.unreachable"] = ("连不上对方的 LocalSend：请确认对方打开了 LocalSend 并停留在前台（锁屏或切到后台可能会停止接收），且两台设备在同一个网络里", "Could not reach the receiver's LocalSend: make sure LocalSend is open on it and in the foreground (it may stop receiving when locked or in the background), on the same network"),
         ["ls.err.busy"] = ("对方正在接收别的文件，请稍后再试", "The receiver is busy with another transfer; try again shortly"),
+        ["qs.on"] = ("启用 Quick Share（实验性）", "Enable Quick Share (experimental)"),
+        ["qs.hint"] = ("与 Android 系统 Quick Share 在同一局域网收发文件，无需手机另装应用。接收前请在两台设备核对验证码。请使用「所有人」可见；暂不支持账号联系人、文本或 Wi-Fi Direct。",
+                       "Send files to and from Android Quick Share on the same LAN without a phone app. Compare the code on both devices before accepting. Use Everyone visibility. Contacts, text and Wi-Fi Direct are not supported."),
+        ["qs.pin"] = ("请核对验证码：{0}", "Compare the code: {0}"),
+        ["qs.ask"] = ("{0} 想通过 Quick Share 发送文件", "{0} wants to send files via Quick Share"),
         ["tray.mtaRelaySub"] = ("苹果 ⇄ 安卓自动转发", "Auto-relay Apple ⇄ Android"),
         ["mta.tag"] = ("互传联盟", "Android Share"),
         ["mta.on"] = ("启用互传联盟（安卓同局域网双向快传）", "Enable Android Share (same-LAN bidirectional)"),

@@ -54,7 +54,8 @@ public partial class SettingsWindow : Window
         ShowIdentity();
         _hotkeyKeys = Hotkey.TryParse(s.HotkeyKeys, out _, out _) ? s.HotkeyKeys : Hotkey.Default;
         ShowHotkey();
-        LanguageBox.SelectedIndex = s.Language switch { "zh" => 1, "en" => 2, _ => 0 };
+        LanguageBox.SelectedItem = LanguageBox.Items.OfType<ComboBoxItem>()
+            .FirstOrDefault(item => string.Equals(item.Tag as string, s.Language, StringComparison.Ordinal)) ?? LanguageBox.Items[0];
         BuildAccents(s.Accent);
         (s.HubIcon switch { "desktop" => HubDesktop, "laptop" => HubLaptop, _ => HubAuto }).IsChecked = true;
         _trusted = [.. s.AlwaysAccept];

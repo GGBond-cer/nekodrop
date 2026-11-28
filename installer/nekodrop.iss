@@ -30,6 +30,11 @@ RestartApplications=no
 [Languages]
 Name: "zh"; MessagesFile: "ChineseSimplified.isl"
 Name: "en"; MessagesFile: "compiler:Default.isl"
+Name: "zht"; MessagesFile: "ChineseTraditional.isl"
+Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
+Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
+Name: "ko"; MessagesFile: "compiler:Languages\Korean.isl"
+Name: "ja"; MessagesFile: "compiler:Languages\Japanese.isl"
 
 [CustomMessages]
 zh.Installing=正在安装驱动、TAP 网卡、防火墙规则和 nekodrop 服务（约需 1 分钟）…
@@ -40,6 +45,26 @@ zh.StartNow=启动 nekodrop
 en.StartNow=Start nekodrop
 zh.Desktop=创建桌面快捷方式
 en.Desktop=Create a desktop shortcut
+zht.Installing=正在安裝驅動程式、TAP 網路介面、防火牆規則及 nekodrop 服務（約需 1 分鐘）…
+zht.Failed=無法安裝 nekodrop 的系統元件：%n%n%1%n%n完整記錄：%2
+zht.StartNow=啟動 nekodrop
+zht.Desktop=建立桌面捷徑
+fr.Installing=Installation du pilote, de l’adaptateur TAP, des règles du pare-feu et du service nekodrop (environ une minute)…
+fr.Failed=Impossible d’installer les composants système de nekodrop :%n%n%1%n%nJournal complet : %2
+fr.StartNow=Lancer nekodrop
+fr.Desktop=Créer un raccourci sur le bureau
+es.Installing=Instalando el controlador, el adaptador TAP, las reglas del firewall y el servicio de nekodrop (aprox. un minuto)…
+es.Failed=No se pudieron instalar los componentes del sistema de nekodrop:%n%n%1%n%nRegistro completo: %2
+es.StartNow=Iniciar nekodrop
+es.Desktop=Crear un acceso directo en el escritorio
+ko.Installing=드라이버, TAP 어댑터, 방화벽 규칙 및 nekodrop 서비스를 설치하는 중입니다(약 1분 소요)…
+ko.Failed=nekodrop 시스템 구성 요소를 설치하지 못했습니다.%n%n%1%n%n전체 로그: %2
+ko.StartNow=nekodrop 실행
+ko.Desktop=바탕 화면 바로 가기 만들기
+ja.Installing=ドライバー、TAP アダプター、ファイアウォール規則、nekodrop サービスをインストールしています（約 1 分）…
+ja.Failed=nekodrop のシステムコンポーネントをインストールできませんでした。%n%n%1%n%n完全なログ：%2
+ja.StartNow=nekodrop を起動
+ja.Desktop=デスクトップにショートカットを作成
 
 [Tasks]
 Name: "desktop"; Description: "{cm:Desktop}"; Flags: unchecked

@@ -17,9 +17,10 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <SatelliteResourceLanguages>zh-Hans;en</SatelliteResourceLanguages>
+    <SatelliteResourceLanguages>zh-Hans;zh-Hant;en;fr;es;ko;ja</SatelliteResourceLanguages>
   </PropertyGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Locales/*.json" WithCulture="false" LogicalName="NekoDrop.Locales.%(Filename)%(Extension)" />
     <PackageReference Include="CoreJ2K" Version="2.4.2.112" />
     <PackageReference Include="CoreJ2K.Windows" Version="2.4.2.112" />
     <Using Remove="System.Windows.Forms" />

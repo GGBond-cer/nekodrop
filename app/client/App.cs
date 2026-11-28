@@ -16,6 +16,7 @@ public sealed class App : Application
     [STAThread]
     public static int Main(string[] args)
     {
+        if (args.Contains("--localization-selftest")) return L.SelfTest();
         if (args.Contains("--unregister")) { Shell.Unregister(); try { AppleId.SignOut(); } catch (Exception) { } return 0; }
         // Chosen in the Share sheet: send what was shared, like Explorer's verb.
         if (args.Length == 0 && Shell.SharedFiles() is { Length: > 0 } shared) args = ["--send", .. shared];
@@ -388,7 +389,7 @@ public sealed class App : Application
     }
 
     /// <summary>
-    /// --snapshot DIR [--lang zh|en]: renders the send, main and settings windows
+    /// --snapshot DIR [--lang code]: renders the send, main and settings windows
     /// with sample devices to DIR\*.png off screen and exits. For checking the
     /// UI without the service, the radio or a visible window.
     /// </summary>
@@ -748,6 +749,7 @@ public sealed class App : Application
     public void ApplyLanguage()
     {
         L.Use(Settings.Language);
+        ApplyTheme();
 
         try { Shell.Register(Settings.StartWithWindows); } catch (Exception) { }
         if (_window is not null) { var w = _window; var shown = w.IsVisible; _window = null; w.Close(); if (shown) ShowWindow(); }

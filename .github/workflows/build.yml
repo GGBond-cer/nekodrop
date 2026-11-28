@@ -40,7 +40,10 @@ jobs:
         shell: pwsh
         run: |
           $exe = 'build\stage\nekodrop.exe'
-          foreach ($v in @(@('light', 'zh'), @('dark', 'zh'), @('light', 'en'), @('colourful', 'zh'))) {
+          $locales = Start-Process $exe -ArgumentList '--localization-selftest' -Wait -PassThru
+          if ($locales.ExitCode -ne 0) { throw "localization self-test: $($locales.ExitCode)" }
+          foreach ($v in @(@('light', 'zh'), @('dark', 'zh'), @('light', 'en'), @('colourful', 'zh'),
+                           @('light', 'zh-Hant'), @('light', 'fr'), @('light', 'es'), @('light', 'ko'), @('light', 'ja'))) {
             $out = "build\snapshots\$($v[0])-$($v[1])"
             $look = if ($v[0] -eq 'colourful') { @('--light', '--colourful') } else { @("--$($v[0])") }
             $p = Start-Process $exe -ArgumentList (@('--snapshot', $out) + $look + @('--lang', $v[1])) -PassThru
