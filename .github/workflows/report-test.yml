@@ -18,6 +18,11 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force "$env:ProgramData\nekodrop" | Out-Null
           Copy-Item .github\report-fixture\ProgramData\* "$env:ProgramData\nekodrop\"
+      - name: Run report.ps1 self-tests (Windows PowerShell 5.1)
+        shell: powershell
+        run: |
+          powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File installer\report.ps1 -SelfTest
+          if ($LASTEXITCODE) { throw "report.ps1 -SelfTest exited $LASTEXITCODE" }
       - name: Run report.ps1 (Windows PowerShell 5.1)
         shell: powershell
         run: |
@@ -34,7 +39,7 @@ jobs:
           $r = Get-Content $md.FullName -Raw
           $all = $r + (Get-Content $txt.FullName -Raw)
           $fail = @()
-          foreach ($want in '## Bring-up', '| Identify the card | ok |', '| Firmware alive | ok |', '| PNVM (AX210 family) | ok |', '| Firmware init (INIT_COMPLETE) | FAIL |', 'UMAC error 0x2010070d', '## Discovery timeline', '## Network') {
+          foreach ($want in '## Bring-up', '| Identify the card | ok |', '| Firmware alive | ok |', '| PNVM (AX210 family) | ok |', '| Firmware init (INIT_COMPLETE) | FAIL |', 'UMAC error 0x2010070d', '## Discovery timeline', '## Network', '## Sleep / wake') {
             if (-not $r.Contains($want)) { $fail += "missing: $want" }
           }
           foreach ($secret in 'Home-5G-Secret', 'a4:b1:c2:d3:e4:f5', '486f6d652d35472d536563726574', '192.168.31.1', 'zhangsan', 'fe80::1c2b', $env:COMPUTERNAME) {

@@ -10,8 +10,8 @@
 # SSIDs, MAC addresses, private IP addresses, the user name and the computer
 # name are replaced by placeholders. Nothing is sent anywhere.
 #
-# -SelfTest checks the Wi-Fi card classification below against made-up device
-# IDs and exits 0 (all pass) or 1; it needs no administrator rights and no card.
+# -SelfTest checks the card classification and report summaries with fixtures.
+# It exits 0 (all pass) or 1 and needs no administrator rights or hardware.
 param(
   [string]$OutDir = '',
   [string]$UserData = '',
@@ -221,6 +221,46 @@ function Get-DiscoverySummary($attemptLines, $engineLines) {
   return $rows
 }
 
+# The System log distinguishes time spent asleep from time spent merely idle.
+# Use only the Kernel-Power event IDs and local timestamps, not the event
+# messages, machine name or XML payload. An empty log is not proof of no sleep.
+function Get-PowerTransitionRows($events) {
+  $states = @{
+    42 = 'Entering sleep'
+    107 = 'Resumed from sleep'
+    506 = 'Entering Modern Standby'
+    507 = 'Exited Modern Standby'
+  }
+  foreach ($e in @($events | Where-Object {
+    $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power' -and
+      $_.TimeCreated -is [datetime] -and $_.Id -is [int] -and $states.ContainsKey($_.Id)
+  } | Sort-Object TimeCreated -Descending | Select-Object -First 20)) {
+    $local = $e.TimeCreated.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss zzz', [Globalization.CultureInfo]::InvariantCulture)
+    "| $local | $($e.Id) | $($states[$e.Id]) |"
+  }
+}
+
+function Get-PowerTransitionSummary {
+  try {
+    $events = @(Get-WinEvent -FilterHashtable @{
+      LogName = 'System'
+      ProviderName = 'Microsoft-Windows-Kernel-Power'
+      Id = 42, 107, 506, 507
+      StartTime = (Get-Date).AddDays(-3)
+    } -MaxEvents 20 -ErrorAction Stop)
+    $rows = @(Get-PowerTransitionRows $events)
+  } catch {
+    if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound,*') {
+      return 'Windows System event log unavailable.'
+    }
+    $rows = @()
+  }
+  if (!$rows.Count) { return 'No matching sleep or wake events recorded in the past 3 days.' }
+  '| Local time | Kernel-Power event | Transition |'
+  '|---|---|---|'
+  $rows
+}
+
 if ($SelfTest) {
   $fail = @()
   $cases = @(
@@ -316,8 +356,34 @@ if ($SelfTest) {
     if (-not $dOld.Contains($want)) { $fail += "discovery timing (older log): missing $want" }
   }
   if (@(Get-DiscoverySummary @() @()).Count) { $fail += 'discovery timing: rows without a radio start' }
+  $provider = 'Microsoft-Windows-Kernel-Power'
+  $baseTime = [datetime]::new(2026, 11, 21, 10, 0, 0, [DateTimeKind]::Local)
+  $power = @(
+    [pscustomobject]@{ ProviderName = $provider; Id = 42; TimeCreated = $baseTime; Message = 'PRIVATE-POWER-PAYLOAD' }
+    [pscustomobject]@{ ProviderName = $provider; Id = 107; TimeCreated = $baseTime.AddMinutes(10) }
+    [pscustomobject]@{ ProviderName = $provider; Id = 506; TimeCreated = $baseTime.AddMinutes(30) }
+    [pscustomobject]@{ ProviderName = $provider; Id = 507; TimeCreated = $baseTime.AddHours(1) }
+    [pscustomobject]@{ ProviderName = $provider; Id = 999; TimeCreated = $baseTime.AddHours(2) }
+    [pscustomobject]@{ ProviderName = 'SomeOtherProvider'; Id = 42; TimeCreated = $baseTime }
+    [pscustomobject]@{ ProviderName = $provider; Id = 107; TimeCreated = $null }
+  )
+  $powerRows = @(Get-PowerTransitionRows $power)
+  $powerText = $powerRows -join "`n"
+  $tail = @('| 507 | Exited Modern Standby |', '| 506 | Entering Modern Standby |',
+            '| 107 | Resumed from sleep |', '| 42 | Entering sleep |')
+  if ($powerRows.Count -ne $tail.Count) { $fail += 'power timeline: wrong number of rows' }
+  else {
+    for ($i = 0; $i -lt $tail.Count; $i++) {
+      if (-not $powerRows[$i].EndsWith($tail[$i])) { $fail += "power timeline: row $i is malformed or unsorted" }
+    }
+  }
+  if ($powerText.Contains('PRIVATE-POWER-PAYLOAD')) { $fail += 'power timeline: event payload leaked' }
+  if ($powerText -notmatch '\| 2026-11-21 11:00:00 [+-]\d\d:\d\d \| 507') { $fail += 'power timeline: missing local timestamp or offset' }
+  if (@(Get-PowerTransitionRows @()).Count) { $fail += 'power timeline: rows without events' }
+  $many = @(1..25 | ForEach-Object { [pscustomobject]@{ ProviderName = $provider; Id = 42; TimeCreated = $baseTime.AddSeconds($_) } })
+  if (@(Get-PowerTransitionRows $many).Count -ne 20) { $fail += 'power timeline: more than 20 rows' }
   if ($fail) { $fail | ForEach-Object { Write-Host "FAIL $_" }; exit 1 }
-  Write-Host "report.ps1 self-test: $($cases.Count) cases, the ID tables and the discovery timing passed"
+  Write-Host "report.ps1 self-test: $($cases.Count) cases, ID tables, discovery timing and power transitions passed"
   exit 0
 }
 
@@ -760,6 +826,13 @@ if ($excludedPorts.Count) {
   W '```'
   W ''
 }
+
+W '## Sleep / wake'
+W ''
+W 'Recent Windows power transitions (up to 20 in 3 days). Compare with the time Wi-Fi or file transfers slowed down. Missing events do not rule out sleep.'
+W ''
+Get-PowerTransitionSummary | ForEach-Object { W $_ }
+W ''
 
 W '## Bluetooth'
 W ''
