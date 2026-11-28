@@ -6,17 +6,23 @@
 
 ---
 
-## v2.3.12 (Preview / 预览版)
+## v2.4.0 (Preview / 预览版)
 
 ### 中文
 
+- **Android 快速分享（Quick Share，实验性）**：在「设置 → 分享与中继」开启；默认关闭。Windows 和 Android 接入同一局域网，在手机系统的快速分享中将接收范围设为「所有人」，即可尝试双向传文件，无需额外安装 Android 应用。接收时核对两端的配对码，再手动接受。不支持 Wi-Fi Direct、联系人模式或跨网中继。加密回环传输已通过；仍需不同 Android 机型真机互测，欢迎在 [#128](https://github.com/zheznanohana/nekodrop/issues/128) 提供机型、Android 版本及测试方向。
+- **新增五种界面语言**：法语、西班牙语、韩语、日语、繁体中文。桌面应用可跟随系统或手动切换，安装程序也提供这五种语言。
 - **改进并发模式的 Wi-Fi 自动重连**：正常连接不中断。需要重连时，优先选择信号可用的、用户曾手动选并连通或最近连通的已保存网络；同名双频网络优先选信号够用的 5 GHz，找不到可用的 5 GHz 时回退到 2.4 GHz。失败的接入点短暂跳过。连接历史在网关可达后才更新。
 - **诊断报告新增 Windows 睡眠／唤醒时间线**，可用变慢时的时间对照。自动重连逻辑已做离线测试，闲置降速场景仍待真机验证。
+- 修正 AirDrop mDNS 在本机 AWDL 接口上的回环过滤（[#126](https://github.com/zheznanohana/nekodrop/pull/126)），恢复 Windows WLAN 时避免重复发起连接（[#127](https://github.com/zheznanohana/nekodrop/pull/127)）。
 
 ### English
 
+- **Android Quick Share (experimental):** enable it in Settings → Sharing & Relay. It is off by default. Connect both devices to the same LAN and set the Android system Quick Share visibility to Everyone to try sending files in both directions. No extra Android app is needed. Verify the pairing code on both devices before accepting. Wi-Fi Direct, contacts mode and cross-network relay are not supported. Encrypted loopback passed; Android device testing is still needed. Please report the phone model, Android version and transfer direction in [#128](https://github.com/zheznanohana/nekodrop/issues/128).
+- **Five new UI languages:** French, Spanish, Korean, Japanese, and Traditional Chinese. The desktop app can follow Windows or use a language you choose; these languages are also available in setup.
 - **Improve Wi-Fi reconnection in Concurrent mode**: keep working connections. When reconnecting, prefer viable saved networks that the user successfully selected or that recently worked. Within the same SSID, prefer a usable 5 GHz access point, fall back to 2.4 GHz, and briefly skip failed access points. Connection history is updated only after the gateway responds.
 - **Add recent Windows sleep/wake transitions to the diagnostic report.** The reconnection policy has offline tests; the reported post-idle slowdown still needs hardware retesting.
+- Filter local AWDL mDNS loopback in AirDrop ([#126](https://github.com/zheznanohana/nekodrop/pull/126)) and avoid a duplicate connection request when handing Wi-Fi back to Windows ([#127](https://github.com/zheznanohana/nekodrop/pull/127)).
 
 ---
 

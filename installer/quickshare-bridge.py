@@ -32,8 +32,8 @@ def safe_name(name):
     name = receive.sanitize_offered_name(name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]', "_", name).strip(" .")
     name = name[:140].rstrip(" .") or "file"
-    stem = name.split(".", 1)[0]
-    if re.fullmatch(r"(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", stem, re.IGNORECASE):
+    stem = name.split(".", 1)[0].rstrip(" ")
+    if re.fullmatch(r"(CON|CONIN\$|CONOUT\$|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])", stem, re.IGNORECASE):
         name = "_" + name
     return name
 
@@ -162,6 +162,14 @@ class Worker:
             self.stop.wait(1)
 
     def sender(self, job, peer, files):
+        last_progress = 0.0
+        def progress(value):
+            nonlocal last_progress
+            now = time.monotonic()
+            if now - last_progress >= 0.18 or value.bytes_sent == value.total_bytes:
+                last_progress = now
+                emit("send", id=job["id"], state="sending", done=value.bytes_sent, total=value.total_bytes)
+
         def opened(sock):
             with self.lock:
                 job["socket"] = sock
@@ -171,7 +179,7 @@ class Worker:
             status = send.send_files(peer.address, peer.port, mdns.stable_endpoint_id(),
                 mdns.build_endpoint_info(self.name, mdns.ShareTargetType.LAPTOP), files,
                 on_pin=lambda p: emit("pin", id=job["id"], pin=p),
-                on_progress=lambda x: emit("send", id=job["id"], state="sending", done=x.bytes_sent, total=x.total_bytes),
+                on_progress=progress,
                 on_socket=opened, source_address=self.address)
             state = ("sent" if status == send.wf_pb2.ConnectionResponseFrame.Status.ACCEPT else
                      "cancelled" if status in (send.RECEIVER_CANCELED, send.USER_CANCELED) else "declined")
@@ -309,34 +317,56 @@ def self_test():
     assert safe_name("CON") == "_CON"
     assert safe_name("file. ") == "file"
     assert safe_name("a:b") == "a_b"
+    assert safe_name("ConOut$.txt") == "_ConOut$.txt"
     with tempfile.TemporaryDirectory() as d:
         base = Path(d)
         f = base / "sample.txt"
         f.write_bytes(b"nekodrop quick share fixture" * 8192)
+        extra = base / "extra"
+        extra.mkdir()
+        duplicate = extra / f.name
+        duplicate.write_bytes(b"second file with the same name")
         target = base / "received"
         target.mkdir()
-        out = []
-        errors = []
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1",0))
-            listener.listen(1)
-            listener.settimeout(10)
-            def listen():
-                try:
-                    conn,_ = listener.accept()
-                    conn.settimeout(10)
-                    out.extend(receive_on(conn,target,lambda files,pin,texts: pin.isdigit(),lambda f:None) or [])
-                except Exception as err:
-                    errors.append(err)
-            thread = threading.Thread(target=listen,daemon=True)
-            thread.start()
-            status = send.send_files("127.0.0.1",listener.getsockname()[1],mdns.stable_endpoint_id(),
-                                     mdns.build_endpoint_info("NekoDrop test",mdns.ShareTargetType.LAPTOP),[f])
-            thread.join(10)
-        assert not errors, errors
-        assert status==send.wf_pb2.ConnectionResponseFrame.Status.ACCEPT and len(out)==1
-        assert out[0].read_bytes()==f.read_bytes()
-    print("Quick Share encrypted loopback and file-safety self-test passed.")
+        existing = target / f.name
+        existing.write_bytes(b"existing file")
+
+        def transfer(accept):
+            out, errors, received_pins, sent_pins = [], [], [], []
+            def offer(files, pin, _):
+                received_pins.append(pin)
+                assert len(files) == 2
+                return accept
+
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                listener.settimeout(10)
+                def listen():
+                    try:
+                        conn, _ = listener.accept()
+                        conn.settimeout(10)
+                        out.extend(receive_on(conn, target, offer, lambda f: None) or [])
+                    except Exception as err:
+                        errors.append(err)
+                thread = threading.Thread(target=listen, daemon=True)
+                thread.start()
+                status = send.send_files("127.0.0.1", listener.getsockname()[1], mdns.stable_endpoint_id(),
+                    mdns.build_endpoint_info("NekoDrop test", mdns.ShareTargetType.LAPTOP), [f, duplicate],
+                    on_pin=sent_pins.append)
+                thread.join(10)
+            assert not errors and not thread.is_alive(), errors
+            assert received_pins == sent_pins and len(sent_pins) == 1 and sent_pins[0].isdigit()
+            return status, out
+
+        status, out = transfer(False)
+        assert status == send.wf_pb2.ConnectionResponseFrame.Status.REJECT and not out
+        assert list(target.iterdir()) == [existing]
+        status, out = transfer(True)
+        assert status == send.wf_pb2.ConnectionResponseFrame.Status.ACCEPT and len(out) == 2
+        assert {p.read_bytes() for p in out} == {f.read_bytes(), duplicate.read_bytes()}
+        assert existing.read_bytes() == b"existing file" and len(list(target.iterdir())) == 3
+    print("Quick Share encrypted loopback passed: matching PINs, accept/reject, byte integrity and no overwrite.")
 
 
 if __name__ == "__main__":
