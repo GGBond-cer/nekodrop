@@ -111,11 +111,34 @@ public sealed class Mt76RadioBackend : IRadioBackend
     public RadioBackendKind Kind => RadioBackendKind.Mt76;
     public string ExeName => "nekodrop-radio-mt.exe";
 
+    internal static bool IsMt7925(AdapterProfile profile) => profile is { VendorId: "14C3", DeviceId: "7925" };
+
+    static readonly HashSet<string> Unii3Regions = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "TW", "CN", "HK", "MO", "US", "CA", "MX", "BR", "AR", "CL", "CO", "PE",
+        "KR", "SG", "MY", "TH", "VN", "PH", "ID", "IN", "AU", "NZ",
+    };
+
+    static int Default5GhzSocialChannel(string? country)
+    {
+        var cc = country is { Length: 2 } c && c != "ZZ" && c != "00"
+            ? c
+            : System.Globalization.RegionInfo.CurrentRegion.TwoLetterISORegionName;
+        return Unii3Regions.Contains(cc) ? 149 : 44;
+    }
+
+    internal static int ChannelFor(AdapterProfile profile, int channel, string? country = null) =>
+        IsMt7925(profile) && channel is not (44 or 149) ? Default5GhzSocialChannel(country) : channel;
+
     public IReadOnlyList<string> BuildArgs(RadioStart s)
     {
-        var args = new List<string> { s.Channel.ToString(), "--width", s.Width.ToString() };
+        bool mt7925 = IsMt7925(s.Profile);
+        int channel = ChannelFor(s.Profile, s.Channel, s.Country);
+        var args = new List<string> { channel.ToString(), "--width", mt7925 ? "80" : s.Width.ToString() };
+        if (mt7925) args.Add("--mt7925");
         if (s.Country is { Length: 2 } c && c != "ZZ" && c != "00") args.AddRange(["--country", c]);
         if (s.StaConf is not null) args.AddRange(["--sta-config", s.StaConf]);
+        if (mt7925 && s.HighThroughput) args.Add("--he80");
         return args;
     }
 }

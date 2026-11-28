@@ -48,6 +48,11 @@ std::string find_firmware_dir() {
 } // namespace
 
 int main(int argc, char **argv) {
+#ifdef MT7925_PROBE
+  const char *name = "mtprobe7925";
+#else
+  const char *name = "mtprobe";
+#endif
   std::string step = "fw", fw_dir, log_path;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
@@ -55,10 +60,16 @@ int main(int argc, char **argv) {
     else if (a == "--fw-dir" && i + 1 < argc) fw_dir = argv[++i];
     else if (a == "--log" && i + 1 < argc) log_path = argv[++i];
     else {
-      std::fprintf(stderr, "usage: mtprobe [id|dma|fw] [--fw-dir <dir>] [--log <file>]\n");
+      std::fprintf(stderr, "usage: %s [id|dma|fw] [--fw-dir <dir>] [--log <file>]\n", name);
       return 2;
     }
   }
+#ifdef MT7925_PROBE
+  if (step == "fw" && fw_dir.empty()) {
+    std::fprintf(stderr, "%s: fw requires --fw-dir with the MT7925 linux-firmware files\n", name);
+    return 2;
+  }
+#endif
   timeBeginPeriod(1);
   std::ofstream log_file;
   if (!log_path.empty()) log_file.open(log_path, std::ios::app);
@@ -72,7 +83,11 @@ int main(int argc, char **argv) {
     if (log_file) log_file << stamp << line << std::endl;
   };
 
+#ifdef MT7925_PROBE
+  Mt7902 dev(true);
+#else
   Mt7902 dev;
+#endif
   dev.set_logger(log);
   dev.set_event_handler([&](const uint8_t *data, size_t len) {
     char line[128];

@@ -36,6 +36,7 @@ Copy-Item $rtlRadio "$stage\radio\nekodrop-radio-rtl.exe"
 $mtBuild = "$repo\build\mtradio"
 Copy-Item "$mtBuild\nekodrop-radio-mt.exe" "$stage\radio\"
 Copy-Item "$mtBuild\firmware\WIFI_RAM_CODE_MT7902_1.bin", "$mtBuild\firmware\WIFI_MT7902_patch_mcu_1_1_hdr.bin" "$stage\radio\firmware\"
+Copy-Item "$mtBuild\firmware\WIFI_RAM_CODE_MT7925_1_1.bin", "$mtBuild\firmware\WIFI_MT7925_PATCH_MCU_1_1_hdr.bin" "$stage\radio\firmware\"
 
 'radio (MediaTek MT7922/MT7921)'
 & "$PSScriptRoot\build-radio-mtk.ps1" | Out-Null

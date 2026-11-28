@@ -67,7 +67,7 @@ Intel AX201、Windows 11、`v2.2.9+`，开启高吞吐模式（HE80 + MTU 1500�
 |---|---|---|---|---|
 | **Intel** | `iwxradio` | AX201 · AX200 · AX210 · AX211 · AX203 (Arrow Lake) · AX411 / Killer AX1690 · 9560 · 9462 | 同时连 Wi-Fi / 按需 | ✅ **实测可用**（AX201 作者实测，AX200 / AX210 / AX211 / AX203 等为社区实测） |
 | **Intel** | `iwxradio` | BE200（Wi-Fi 7，MLD） | 同时连 Wi-Fi / 按需 | 🧪 实验性 |
-| **MediaTek / AMD** | `mtradio` | MT7902 | 5 GHz 同时连 Wi-Fi / 按需 | ✅ 双向实测可用 |
+| **MediaTek / AMD** | `mtradio` | MT7902 · MT7925 | 5 GHz 同时连 Wi-Fi / 按需 | ✅ 双向实测可用 |
 | **MediaTek / AMD** | `mtkradio` | MT7922 / AMD RZ616 | 5 GHz 同时连 Wi-Fi（实验性）/ 按需 | ✅ 双向实测可用 |
 | **MediaTek / AMD** | `mtkradio` | MT7921 / AMD RZ608 | 按需接管 | 🧪 实验性 |
 | **Realtek** | `devourer` | RTL8852CE | 按需接管 | ✅ 社区实测可用（约 24.5 MB/s） |

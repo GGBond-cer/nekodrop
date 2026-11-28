@@ -1,18 +1,23 @@
-# mtradio — MediaTek MT7902 radio
+# mtradio — MediaTek MT7902 / MT7925 radio
 
-`nekodrop-radio-mt.exe` drives a MediaTek MT7902 (`14C3:7902`) from user mode
-through the register proxy (`driver/regproxy`), like the Intel and Realtek
-radios. It is a port of the parts of Linux [mt76](https://github.com/openwrt/mt76)
-(`mt7921/`, `mt76_connac*`, mt76 commit `41d5d1d`) that AirDrop needs:
+`nekodrop-radio-mt.exe` drives MediaTek MT7902 (`14C3:7902`, Connac2) and
+MT7925 (`14C3:7925`, Connac3 via `--mt7925`) from user mode through the
+register proxy (`driver/regproxy`), like the Intel and Realtek radios. It is a
+port of the parts of Linux [mt76](https://github.com/openwrt/mt76) (`mt7921/`,
+`mt7925/`, `mt76_connac*`, mt76 commit `41d5d1d`) that AirDrop needs:
 
 - firmware boot (ROM patch + RAM code) and WFDMA rings in AWE pages below 4 GiB
+  (1 MiB BAR0 on MT7902; 2 MiB BAR0 + Connac3 fixed-map remap on MT7925)
 - the firmware's sniffer on one channel for receiving, and cut-through TX with
-  TX-free reports for sending
-- one ad-hoc interface whose address the MAC acknowledges
+  TX-free reports for sending (`mt7902_radio.cpp` for Connac2, `mt7925_radio.cpp`
+  for Connac3 TXD/RXD, `UNI_CMD` TLV framing, and `STA_REC_BA` / `RA`)
+- one interface whose address the MAC acknowledges, plus dual-channel 5 GHz
+  AWDL slot-following (`149 <-> 44` or peer's home channel) on MT7925
 - a STA record per AWDL peer: firmware rate control and Block Ack sessions,
-  so A-MPDU works both ways
+  with VHT80 2SS TX A-MPDU and optional `--he80` RX A-MSDU aggregation on MT7925
 - the radio pipe protocol (`radio_link.h`) and the AWDL policy ported from
-  ForbiddenItlwm, so the service and awdld treat it like the other radios
+  ForbiddenItlwm (`tests/test_awdl_policy.cpp`), so the service and awdld treat
+  it like the other radios
 
 - a Wi-Fi station beside AWDL (Concurrent mode), see below
 
@@ -50,34 +55,41 @@ and checks ping and a download over TAP.
 
 ## Firmware
 
-It needs linux-firmware's `WIFI_RAM_CODE_MT7902_1.bin` and
-`WIFI_MT7902_patch_mcu_1_1_hdr.bin` (`scripts/fetch-deps.ps1` downloads them,
-pinned and hash-checked). The copy in MediaTek's Windows driver boots, but it
-ignores the unified (UNI) commands this port sends.
+It needs linux-firmware's `WIFI_RAM_CODE_MT7902_1.bin` +
+`WIFI_MT7902_patch_mcu_1_1_hdr.bin` for MT7902, and
+`WIFI_RAM_CODE_MT7925_1_1.bin` + `WIFI_MT7925_PATCH_MCU_1_1_hdr.bin` for MT7925
+(`scripts/fetch-deps.ps1` downloads them, pinned and hash-checked). The copy in
+MediaTek's Windows driver boots, but ignores the unified (UNI) commands this
+port sends.
 
 ## Build and test
 
     scripts\fetch-deps.ps1
-    scripts\build-radio-mt.ps1      # -> build\mtradio
+    scripts\build-radio-mt.ps1      # -> build\mtradio (runs ccmp_test + test-awdl-policy)
 
 Hardware tests take the card from Windows for a minute (the wired network
 stays up) and always give it back to MediaTek's driver. Run them elevated:
 
 - `mtradio\scripts\smoke-test.ps1` — binds the register proxy from a local
-  `driver\regproxy` build, runs `mtprobe.exe` (chip ID, DMA, firmware boot)
+  `driver\regproxy` build, runs `mtprobe.exe` on MT7902 (chip ID, DMA, firmware boot)
+- `mtradio\scripts\smoke-mt7925.ps1` — supervised MT7925 (`14C3:7925`) bring-up
+  (`mtprobe7925.exe` / `nekodrop-radio-mt.exe --mt7925`) with automatic rollback
 - `mtradio\scripts\test-radio.ps1` — receive and send rounds on 2.4 and 5 GHz
 - `mtradio\scripts\test-installed.ps1` — the same with nekodrop installed, using
   its register proxy; e.g. `-Runs '44 --test-sta 60'`
 
-`mtprobe` and the daemon run as SYSTEM through a one-shot scheduled task:
-AWE pages need SeLockMemoryPrivilege.
+`mtprobe` / `mtprobe7925` and the daemon run as SYSTEM through a one-shot
+scheduled task: AWE pages need SeLockMemoryPrivilege.
 
 ## Known limits
 
-- On 2.4 GHz, frames that need an ACK never complete (cause unknown; maybe
-  Bluetooth coexistence), so the daemon sends without ACK there. AirDrop
-  itself moves to 5 GHz, and the Wi-Fi station joins 5 GHz networks only.
-- Sending to an iPhone is slower than receiving (about 5 vs 15 MB/s measured).
+- On 2.4 GHz, frames that need an ACK never complete on MT7902 (cause unknown;
+  maybe Bluetooth coexistence), and MT7925 runs AWDL on 5 GHz 80 MHz (`44` / `149`),
+  so the Wi-Fi station joins 5 GHz networks only on both cards.
+- On MT7902, sending to an iPhone is slower than receiving (about 5 vs 15 MB/s
+  measured). On MT7925 (`SUBSYS_60001A3B`), VHT80 2SS TX + `--he80` RX A-MSDU
+  reaches ~37.5 MB/s average (52.5 MB/s peak) sending on same-channel 5 GHz,
+  ~20.8 MB/s across dual-channel `149 <-> 48` hops, and ~27.5 MB/s receiving.
 
 ## Licence
 

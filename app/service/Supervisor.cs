@@ -569,6 +569,7 @@ public sealed class Supervisor : IDisposable
         if (!_wanted) return;
         WaitForWifiReconnect("taking the card");
         if (!_wanted) return;
+        channel = Mt76RadioBackend.ChannelFor(_profile, channel, _cfg.Country);
         lock (_lock)
         {
             State = RadioState.Starting; _channel = channel; _detail = "";
@@ -682,6 +683,8 @@ public sealed class Supervisor : IDisposable
             else if (Card.Find() is { } kc) { _profile = kc.Profile; _caps = kc.Profile.Capabilities; }
             if (!_wanted) { lock (_lock) State = RadioState.Off; Publish(); return; }
             if (!kernel && EffectiveMode() == NetMode.Concurrent) EnsureTapMac();
+            channel = Mt76RadioBackend.ChannelFor(_profile, channel, _cfg.Country);
+            lock (_lock) _channel = channel;
             var launch = CardCatalog.BuildRadioLaunch(_profile, channel, kernel, _cfg.Country, staConf, true, _cfg.FastUnlock,
                                                       _cfg.CoexPlan, btCoexBalanced: true, highThroughput: _cfg.HighThroughput);
             _startedAt = DateTime.UtcNow;
@@ -690,7 +693,8 @@ public sealed class Supervisor : IDisposable
             for (int i = 0; i < 100 && _wanted && State == RadioState.Starting && !radio.HasExited; i++) Thread.Sleep(100);
             if (!_wanted) return;
             if (radio.HasExited) throw new InvalidOperationException("the radio exited during bring-up: " + _detail);
-            string[] awdlArgs = _cfg.HighThroughput
+            bool useHe80 = Mt76RadioBackend.IsMt7925(_profile) ? launch.Args.Contains("--he80") : _cfg.HighThroughput;
+            string[] awdlArgs = useHe80
                 ? ["-c", channel.ToString(), "-H", "-M", "1500"]
                 : ["-c", channel.ToString()];
             _awdld = Spawn(Path.Combine(_root, "awdl", "awdld.exe"), awdlArgs, OnAwdldLine);
@@ -698,6 +702,12 @@ public sealed class Supervisor : IDisposable
         catch (Exception e)
         {
             try { File.Delete(Path.Combine(ServiceConfig.Folder, "run", "sta.conf")); } catch (Exception) { }
+            if (Mt76RadioBackend.IsMt7925(_profile))
+            {
+                KillDaemons();
+                try { EnsureVendorDriver(); }
+                catch (Exception restoreError) { Say("MT7925 driver restore failed: " + restoreError.Message); }
+            }
             var bind = e as CardBindException ?? e.InnerException as CardBindException;
             Say("start failed: " + (bind?.Message ?? e.Message));
             lock (_lock)
@@ -757,11 +767,20 @@ public sealed class Supervisor : IDisposable
         new(@"\| rx action \d+, data (\d+)", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
     long _awdldRxData = -1;
 
+    internal static string NormalizeRadioLine(string line)
+    {
+        var at = line.IndexOf("radio: ", StringComparison.Ordinal);
+        var text = at >= 0 ? line[(at + 7)..] : line;
+        if (text.StartsWith("[+", StringComparison.Ordinal) &&
+            text.IndexOf("] ", StringComparison.Ordinal) is > 0 and var close)
+            text = text[(close + 2)..];
+        return text;
+    }
+
     void OnRadioLine(string line)
     {
         Say("radio: " + line);
-        var at = line.IndexOf("radio: ", StringComparison.Ordinal);
-        var text = at >= 0 ? line[(at + 7)..] : line;
+        var text = NormalizeRadioLine(line);
         if (text.StartsWith("ready on channel", StringComparison.Ordinal))
         {
             bool bootScan, bootBackground;
@@ -849,7 +868,8 @@ public sealed class Supervisor : IDisposable
                         await Task.Delay(TimeSpan.FromSeconds(30));
                         bool bounce;
                         lock (_lock)
-                            bounce = State == RadioState.On && _launchGen == gen && _channel == passiveCh &&
+                            bounce = State == RadioState.On && !Mt76RadioBackend.IsMt7925(_profile) &&
+                                     _launchGen == gen && _channel == passiveCh &&
                                      _channel > 14 && !_channelOpen && _rxToUs == 0 && _wifi != "connected";
                         if (bounce)
                         {

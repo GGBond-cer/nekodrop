@@ -14,18 +14,21 @@
 #include <cstring>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
 #include "radio_link.h"
+#include "radio_shm.h"
 
 class PipeServer {
 public:
   /* `stopping` is polled while an operation waits, so a blocked read or
    * connect ends soon after the daemon is asked to stop. */
-  PipeServer(const std::string &name, std::function<bool()> stopping)
+  PipeServer(const std::string &name, std::function<bool()> stopping, bool enable_shm)
       : _stopping(std::move(stopping)) {
+    if (enable_shm) _shm.emplace();
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, FALSE};
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorA(
@@ -52,6 +55,8 @@ public:
 
   bool valid() const { return _handle != INVALID_HANDLE_VALUE; }
   bool connected() const { return _connected; }
+  uint8_t shm_cap_flag() const { return _shm ? _shm->cap_flag() : 0; }
+  bool pop_shm_tx(std::vector<uint8_t> &out) { return _connected && _shm && _shm->pop_tx(out); }
 
   /* A client that connected and already left still counts as connected here:
    * its departure shows up as a failed first read. */
@@ -67,6 +72,7 @@ public:
         return false;
       }
     }
+    if (_shm) _shm->reset();
     _connected = true;
     return true;
   }
@@ -117,10 +123,14 @@ public:
     return write_all(_out.data(), static_cast<DWORD>(_out.size()));
   }
 
-  /* Appends a framed packet into the RX batch buffer; flushes automatically
-   * once >= 32 KiB accumulate so one dev.poll() burst becomes one WriteFile. */
+  /* Appends a framed packet into the RX data plane: zero-copy shared-memory
+   * ring when the client enabled SHM, otherwise batched over the Named Pipe. */
   bool queue_send(radio_link_type type, std::span<const uint8_t> payload) {
     if (!_connected) return false;
+    if (type == RADIO_LINK_RX && _shm && _shm->client_ready()) {
+      (void)_shm->push_rx(payload.data(), static_cast<uint32_t>(payload.size()), false);
+      return true;
+    }
     std::lock_guard<std::mutex> lock(_write_mutex);
     const radio_link_header header{static_cast<uint16_t>(type), 0,
                                    static_cast<uint32_t>(payload.size())};
@@ -139,6 +149,10 @@ public:
 
   bool flush_send() {
     if (!_connected) return false;
+    if (_shm && _shm->client_ready()) {
+      _shm->wake_rx();
+      return true;
+    }
     std::lock_guard<std::mutex> lock(_write_mutex);
     if (_rx_batch.empty()) return true;
     const bool ok = write_all(_rx_batch.data(), static_cast<DWORD>(_rx_batch.size()));
@@ -206,4 +220,5 @@ private:
   std::vector<uint8_t> _rx_batch; /* under _write_mutex */
   std::vector<uint8_t> _in = std::vector<uint8_t>(kBufferBytes);
   DWORD _taken = 0, _filled = 0;
+  std::optional<RadioShmServer> _shm;
 };

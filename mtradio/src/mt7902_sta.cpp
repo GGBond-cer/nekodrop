@@ -30,7 +30,6 @@ constexpr uint8_t kWtblResetAndSet = 1, kWtblSet = 2;
 constexpr uint8_t kConnStateDisconnect = 0, kConnStatePortSecure = 2;
 constexpr uint8_t kBaTypeOriginator = 1, kBaTypeRecipient = 2;
 constexpr uint8_t kStaStateAssoc = 2;
-constexpr uint8_t kMcuUniStaRecUpdate = 0x03;
 
 /* A STA_REC_UPDATE message: sta_req_hdr, then TLVs; one of them may be
  * STA_REC_WTBL holding a wtbl_req_hdr and nested TLVs. Offsets, not
@@ -90,6 +89,7 @@ template <class T> void put(uint8_t *at, size_t off, T v) { std::memcpy(at + off
 } // namespace
 
 bool Mt7902::sta_add(uint8_t wcid, const uint8_t peer[6], const PeerCaps &caps, uint8_t omac) {
+  if (is_mt7925()) return sta_add_mt7925(wcid, peer, caps, omac);
   StaReq r(wcid, omac);
   { /* mt76_connac_mcu_sta_basic_tlv, ad-hoc */
     uint8_t *t = r.add(kStaRecBasic, 20);
@@ -155,6 +155,7 @@ bool Mt7902::sta_add(uint8_t wcid, const uint8_t peer[6], const PeerCaps &caps, 
 }
 
 bool Mt7902::sta_remove(uint8_t wcid, const uint8_t peer[6], uint8_t omac) {
+  if (is_mt7925()) return sta_remove_mt7925(wcid, peer, omac);
   StaReq r(wcid, omac);
   uint8_t *t = r.add(kStaRecBasic, 20);
   put<uint32_t>(t, 4, kConnectionInfraSta);
@@ -167,7 +168,8 @@ bool Mt7902::sta_remove(uint8_t wcid, const uint8_t peer[6], uint8_t omac) {
 }
 
 bool Mt7902::sta_ba(uint8_t wcid, const uint8_t peer[6], uint8_t tid, uint16_t ssn, uint16_t win, bool tx,
-                    bool enable, uint8_t omac) {
+                    bool enable, uint8_t omac, bool amsdu) {
+  if (is_mt7925()) return sta_ba_mt7925(wcid, tid, ssn, win, tx, enable, omac, amsdu);
   { /* mt76_connac_mcu_wtbl_ba_tlv (connac2) */
     StaReq r(wcid, omac);
     r.wtbl(kWtblSet, wcid);

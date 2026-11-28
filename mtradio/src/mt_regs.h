@@ -4,6 +4,7 @@
  * / ISC, MediaTek and Lorenzo Bianconi). Only what this user-mode driver uses. */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace mt {
@@ -91,6 +92,27 @@ constexpr unsigned kTxRingFwdl = 16;
 constexpr unsigned kRxRingMcu = 0;
 constexpr unsigned kRxRingData = 2;
 
+/* MT7925 PCIe bring-up, from mt7925/regs.h and the shared mt792x registers. */
+namespace mt7925 {
+constexpr uint32_t kHifRemap = 0x155024;
+constexpr uint32_t kHifWindow = 0x130000;
+constexpr uint32_t kWfsysReset = 0x7c000140;
+constexpr uint32_t kEmiCtl = 0x18011100;
+constexpr uint32_t kEmiSleepProtection = bit(1);
+constexpr uint32_t kResetRxPointers = wfdma0(0x280);
+constexpr uint32_t kRxPriority = wfdma0(0x298);
+constexpr uint32_t kTxPriority = wfdma0(0x29c);
+constexpr uint32_t kDmaExt1 = 0x7c0242b4;
+constexpr uint16_t kChipConfig = 0x0e;
+constexpr uint16_t kNicCapabilityTag = 3;
+constexpr size_t kRxHeaderExtra = 8; /* MT7925 MCU RXD has two additional words */
+constexpr uint32_t kPatchAddress = 0xe0002800;
+constexpr uint16_t kMonitorWcid = 19;        /* MT792x_WTBL_RESERVED, first virtual interface (omac 0) */
+constexpr uint16_t kStationMonitorWcid = 18; /* MT792x_WTBL_RESERVED - 1, station interface (omac 1) */
+constexpr const char *kRamFile = "WIFI_RAM_CODE_MT7925_1_1.bin";
+constexpr const char *kPatchFile = "WIFI_MT7925_PATCH_MCU_1_1_hdr.bin";
+}
+
 /* ---- DMA descriptor ---- */
 struct Desc {
   uint32_t buf0;
@@ -159,7 +181,8 @@ constexpr unsigned kNicCapMacAddr = 7;
 
 /* UNI command options (MCU_CMD_ACK | MCU_CMD_UNI | MCU_CMD_SET) */
 constexpr uint8_t kMcuCmdUniExtAck = 0x7, kMcuCmdUniQueryAck = 0x3;
-constexpr uint8_t kMcuUniDevInfoUpdate = 0x01, kMcuUniBssInfoUpdate = 0x02, kMcuUniSniffer = 0x24;
+constexpr uint8_t kMcuUniDevInfoUpdate = 0x01, kMcuUniBssInfoUpdate = 0x02,
+                  kMcuUniStaRecUpdate = 0x03, kMcuUniEdcaUpdate = 0x04, kMcuUniSniffer = 0x24;
 constexpr uint8_t kMcuExtChannelSwitch = 0x08, kMcuExtEfuseBufferMode = 0x21,
                   kMcuExtMacInitCtrl = 0x46, kMcuExtSetRxPath = 0x4e;
 constexpr uint8_t kMcuCeSetRxFilter = 0x0a, kMcuCeSetChanDomain = 0x0f;
@@ -186,7 +209,7 @@ constexpr uint32_t kRxd4PayloadFormatMask = 0x3;
 /* TXD (MT_TXD*) */
 constexpr unsigned kTxdSize = 32;
 constexpr uint32_t kTxTypeCt = 0;
-constexpr uint32_t kLmacAc01 = 0x1, kLmacAltx0 = 0x10;
+constexpr uint32_t kLmacAc00 = 0x0, kLmacAc01 = 0x1, kLmacAltx0 = 0x10;
 constexpr uint32_t kHdrFormat80211 = 2;
 constexpr uint32_t kTxd2FixRate = bit(31), kTxd2HtcVld = bit(13), kTxd2Multicast = bit(10);
 constexpr uint32_t kTxd3SnValid = bit(31), kTxd3BaDisable = bit(28), kTxd3NoAck = bit(0);
@@ -194,7 +217,7 @@ constexpr uint32_t kTxd6FixedBw = bit(2);
 constexpr uint16_t kMsduIdValid = 0x8000;
 constexpr uint16_t kTxdLenLast = 0x8000;
 constexpr unsigned kTxFrameOffset = 256;
-constexpr uint8_t kPhyTypeCck = 0, kPhyTypeOfdm = 1, kPhyTypeHt = 2;
+constexpr uint8_t kPhyTypeCck = 0, kPhyTypeOfdm = 1, kPhyTypeHt = 2, kPhyTypeVht = 4;
 
 #pragma pack(push, 1)
 struct McuTxd { /* mt76_connac2_mcu_txd: hardware TXD, then the command header */

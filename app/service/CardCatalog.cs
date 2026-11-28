@@ -93,6 +93,7 @@ public static class CardCatalog
     /* The card completes no frame that waits for an acknowledgement on 2.4 GHz
      * (mtradio's --test-kinds), and a station's every frame does: 5 GHz only. */
     static readonly AdapterCapabilities MediaTekCaps = new(true, false, false, false, 0x10000, StationOn24GHz: false);
+    static readonly AdapterCapabilities Mt7925Caps = new(true, false, false, false, 0x200000, StationOn24GHz: false);
     static readonly string[] MediaTekProviders = ["MediaTek"];
     /* Same Connac2 / mt7921 family as MT7902: 2.4 GHz ACKed TX is unverified on
      * MT7922, so Concurrent Wi-Fi stays 5 GHz only. MT7921 (7961 / RZ608) runs
@@ -139,6 +140,8 @@ public static class CardCatalog
         // Concurrent with a 5 GHz network (the radio's host-side station shares the
         // card's one channel with AWDL); 1 MiB BAR0.
         new AdapterProfile("14C3", "7902", "MediaTek", "MT7902", RadioBackendKind.Mt76, MediaTekCaps,
+            ProxyInf, ProxyService, ProxyProvider, MediaTekProviders, Active: true),
+        new AdapterProfile("14C3", "7925", "MediaTek", "MT7925", RadioBackendKind.Mt76, Mt7925Caps,
             ProxyInf, ProxyService, ProxyProvider, MediaTekProviders, Active: true),
         // MediaTek MT7922 / MT7921 (nekodrop-radio-mtk.exe, mtkradio/):
         // Concurrent with a 5 GHz network (experimental, host-side station shares
@@ -235,6 +238,7 @@ public static class CardCatalog
         new("be200", "Intel BE200 (experimental)", "8086", RadioBackendKind.Iwx, Be200Caps, IntelProviders),
         new("rtl8852ce", "Realtek RTL8852CE", "10EC", RadioBackendKind.Devourer, RealtekCaps, ["Realtek"]),
         new("mt7902", "MediaTek MT7902", "14C3", RadioBackendKind.Mt76, MediaTekCaps, MediaTekProviders),
+        new("mt7925", "MediaTek MT7925", "14C3", RadioBackendKind.Mt76, Mt7925Caps, MediaTekProviders),
         new("mt7922", "MediaTek MT7922 / MT7921 (RZ616 / RZ608)", "14C3", RadioBackendKind.MtkRadio, MtkRadioCaps, MtkRadioProviders),
     ];
 
@@ -246,7 +250,7 @@ public static class CardCatalog
     {
         if (!TryParsePciId(instanceOrHardwareId, out var v, out var d)) return null;
         var m = ManualModels.FirstOrDefault(x => x.Key == modelKey);
-        if (m is null || m.VendorId != v) return null;
+        if (m is null || m.VendorId != v || (m.Key == "mt7925" && d != "7925")) return null;
         return new AdapterProfile(v, d, v switch { "8086" => "Intel", "14C3" => "MediaTek", _ => "Realtek" }, m.Name + " (chosen in settings)", m.Backend,
                                   m.Capabilities, ProxyInf, ProxyService, ProxyProvider, m.VendorProviderPatterns,
                                   Active: true, RadioFamily: m.Backend == RadioBackendKind.Iwx ? m.Key : null);
@@ -274,7 +278,7 @@ public static class CardCatalog
         // (14C3:7902), and MediaTek MT7922/MT7921 (14C3:0616, 7922, 7961, 0608) = 23 active profiles.
         string[] intel = ["43F0", "A0F0", "02F0", "06F0", "34F0", "3DF0", "4DF0",
                           "2723", "2725", "7A70", "7AF0", "51F0", "51F1", "54F0", "7F70", "7740"];
-        Check(ActiveProfiles.Count == intel.Length + 7, $"{ActiveProfiles.Count} active profiles, expected {intel.Length + 7}");
+        Check(ActiveProfiles.Count == intel.Length + 8, $"{ActiveProfiles.Count} active profiles, expected {intel.Length + 8}");
         Check(AllProfiles.Count == ActiveProfiles.Count, $"{AllProfiles.Count} total profiles, expected {ActiveProfiles.Count}");
         foreach (var dev in intel)
         {
@@ -383,13 +387,32 @@ public static class CardCatalog
                   !mt.Capabilities.StationOn24GHz, "14C3:7902 capabilities");
             Check(AdapterCapabilities.IntelDefault.StationOn24GHz, "Intel station must keep 2.4 GHz");
             Check(EffectiveMode(NetMode.Concurrent, mt.Capabilities) == NetMode.Concurrent, "14C3:7902 Concurrent changed");
-            Check(SameLaunch(BuildRadioLaunch(mt, 44, false, "JP", @"C:\run\sta.conf", true, true, true, true),
+            Check(SameLaunch(BuildRadioLaunch(mt, 44, false, "JP", @"C:\run\sta.conf", true, true, true, true, highThroughput: true),
                              "nekodrop-radio-mt.exe", "44", "--width", "80", "--country", "JP", "--sta-config", @"C:\run\sta.conf"),
-                  "Mt76 launch args with a station");
+                  "Mt76 MT7902 launch args with a station must omit --he80");
             Check(SameLaunch(BuildRadioLaunch(mt, 6, false, "", null, false, false),
                              "nekodrop-radio-mt.exe", "6", "--width", "20"),
                   "Mt76 ch 6 default launch args");
         }
+        Check(MatchActive(@"PCI\VEN_14C3&DEV_7925&SUBSYS_60001A3B") is { } mt7925 &&
+              EffectiveMode(NetMode.Concurrent, mt7925.Capabilities) == NetMode.Concurrent &&
+              !mt7925.Capabilities.StationOn24GHz &&
+              SameLaunch(BuildRadioLaunch(mt7925, 6, false, "TW", @"C:\run\sta.conf", true, true),
+                         "nekodrop-radio-mt.exe", "149", "--width", "80", "--mt7925", "--country", "TW",
+                         "--sta-config", @"C:\run\sta.conf") &&
+              SameLaunch(BuildRadioLaunch(mt7925, 6, false, "TW", @"C:\run\sta.conf", true, true, highThroughput: true),
+                         "nekodrop-radio-mt.exe", "149", "--width", "80", "--mt7925", "--country", "TW",
+                         "--sta-config", @"C:\run\sta.conf", "--he80") &&
+              SameLaunch(BuildRadioLaunch(mt7925, 6, false, "JP", null, true, true),
+                         "nekodrop-radio-mt.exe", "44", "--width", "80", "--mt7925", "--country", "JP"),
+              "MT7925 launch: 5 GHz Concurrent & OnDemand, 80 MHz (149 in TW, 44 in JP, --he80 in high-throughput)");
+        Check(Supervisor.NormalizeRadioLine("10:00:05.100 radio: ready on channel 149, waiting for a client") ==
+                  "ready on channel 149, waiting for a client" &&
+              Supervisor.NormalizeRadioLine("[+001.643s] radio: ready on channel 149, waiting for a client") ==
+                  "ready on channel 149, waiting for a client" &&
+              Supervisor.NormalizeRadioLine("radio: [+001.852s] event: wifi connected") ==
+                  "event: wifi connected",
+              "Supervisor radio line normalization");
 
         // Built-in MediaTek MT7922 / MT7921: active, MtkRadio backend, 1 MiB BAR.
         // MT7922 keeps Concurrent (5 GHz only); MT7921 (7961/0608) is forced to OnDemand (#72).
@@ -500,7 +523,7 @@ public static class CardCatalog
 
         // Ethernet chips from the same vendors and Wi-Fi cards nekodrop does not know.
         foreach (var other in new[] { "PCI\\VEN_8086&DEV_15F3&SUBSYS_00008086\\1", "PCI\\VEN_10EC&DEV_8168&SUBSYS_00000000\\1",
-                                      "PCI\\VEN_14C3&DEV_7925&SUBSYS_00000000\\1", "PCI\\VEN_8086&DEV_7E40&SUBSYS_00908086\\1" })
+                                      "PCI\\VEN_14C3&DEV_7927&SUBSYS_00000000\\1", "PCI\\VEN_8086&DEV_7E40&SUBSYS_00908086\\1" })
         {
             Check(MatchActive(other) is null, $"{other} would be taken");
             Check(Classify(other) is null, $"{other} is classified");

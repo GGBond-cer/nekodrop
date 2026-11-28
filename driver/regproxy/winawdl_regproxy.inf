@@ -51,6 +51,7 @@ HKR,,Icon,,"-5"
 %DeviceDescMtk792x% = RegProxy, PCI\VEN_14C3&DEV_7922
 %DeviceDescMtk792x% = RegProxy, PCI\VEN_14C3&DEV_7961
 %DeviceDescMtk792x% = RegProxy, PCI\VEN_14C3&DEV_0608
+%DeviceDescMt7925% = RegProxy, PCI\VEN_14C3&DEV_7925
 
 [SourceDisksNames]
 1 = %DiskName%
@@ -109,5 +110,6 @@ DeviceDesc = "Intel Wi-Fi user-space register proxy (nekodrop)"
 DeviceDescRtl = "Realtek RTL8852CE user-space register proxy (nekodrop)"
 DeviceDescMtk = "MediaTek MT7902 user-space register proxy (nekodrop)"
 DeviceDescMtk792x = "MediaTek MT7921/MT7922 user-space register proxy (nekodrop)"
+DeviceDescMt7925 = "MediaTek MT7925 user-space register proxy (nekodrop)"
 DiskName   = "winawdl register proxy"
 WudfRdDisplayName = "Windows Driver Foundation - User-mode Driver Framework Reflector"
