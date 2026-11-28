@@ -6,6 +6,33 @@
 
 ---
 
+## v2.3.11 (Preview / 预览版)
+
+### 中文
+
+- **新增纯用户态 MediaTek MT7925 (`14C3:7925`) 5 GHz AirDrop 与 5 GHz 并发 Wi-Fi 支持（PR #123，感谢 [@Benson5650](https://github.com/Benson5650)）**：
+  - 零内核驱动、免测试签名，已在开启 VBS + HVCI 的 Windows 11 真机验证（`SUBSYS_60001A3B`，支持 5 GHz 双向大文件高速收发、A-MPDU 发送、HE80/A-MSDU 接收、跨信道时隙跟踪以及 5 GHz 并发上网）；所有新路径严格按 `is_mt7925()` 隔离，不影响现有 MT7902 / MT7921 / MT7922 / Intel / Realtek。
+- **新增电脑端「二次点击取消传输」与 AirDrop 接收中途取消**：
+  - 传输进行中（覆盖发送中 / 接收中、雷达视图 / 列表视图、主窗口 / 发送窗口，以及 AirDrop / 互传联盟 / LocalSend 三协议）：第 1 次点击设备图标变为红叉并提示「再点取消」，第 2 次点击立即取消；3 秒不操作、点击窗口空白处、按 `Esc` 或右键自动退回正常进度环，既防误触又无需额外按钮。
+  - 补齐 AirDrop 接收端 `{"do": "cancel"}` 取消能力：中途取消立即断开上传 socket 并丢弃未完成临时文件，绝不落盘残缺文件。
+- **修复 Intel AX211/AX210 在 RX Block Ack 关混杂模式后丢弃单播 AWDL 帧（[#30](https://github.com/zheznanohana/nekodrop/issues/30)、[#118](https://github.com/zheznanohana/nekodrop/pull/118)、[#122](https://github.com/zheznanohana/nekodrop/issues/122)）**：
+  - 当 `BaFilter` 关闭 `IN_PROMISC` 且未开启 TX 聚合时，此前监听 MAC 上下文仍把 `bssid_addr` 留在广播地址且未设基础 ACK 速率，导致 AX211/AX210 固件滤掉对端单播帧（mDNS 单播回复、TCP ACK、ICMP，引发双向不可见或传输卡停）。现同步切到 `kAwdlBssid` 并设置基础 ACK 速率，同时保留 `IN_PROMISC=0` 以维持 50+ MiB/s 硬件 RX Block ACK 接收。
+- **A-MPDU 发送卡死改为退避重试而非永久禁用（PR #121，感谢 [@sh17632](https://github.com/sh17632)）**：
+  - 第 1 次无 BA 退避 60 秒，第 2 次及以后退避 5 分钟，不再永久锁死单帧队列；后续任意一次成功产生 Block Ack 的大文件发送完成即清零计数。
+
+### English
+
+- **Add pure user-mode MediaTek MT7925 (`14C3:7925`) 5 GHz AirDrop and 5 GHz Concurrent Wi-Fi support (PR #123, thanks [@Benson5650](https://github.com/Benson5650)):**
+  - Zero kernel drivers, no test signing required, verified on Windows 11 with VBS + HVCI enabled (`SUBSYS_60001A3B`: bidirectional 5 GHz AirDrop, VHT80 TX A-MPDU, optional HE80 RX A-MSDU, cross-channel AWDL slot-following, and 5 GHz Concurrent Wi-Fi). Strictly gated on `is_mt7925()` to preserve MT7902 and all other cards.
+- **Add two-click armed transfer cancellation on PC and AirDrop receive-side abort:**
+  - Works for both sending and receiving across Radar/List views, Main/Send windows, and all three protocols (AirDrop, MTA, LocalSend): 1st click arms a red `×` ("Click again to cancel") while transfer continues; 2nd click cancels; 3 s timeout, clicking outside, `Esc`, or right-click disarms cleanly back to live progress.
+  - AirDrop receiver now handles `{"do": "cancel"}` by aborting the active `/Upload` socket, discarding incomplete temporary files, and emitting `lost (reason='cancelled')`.
+- **Fix Intel AX211/AX210 dropping unicast AWDL frames when `BaFilter` clears `IN_PROMISC` without TX aggregation ([#30](https://github.com/zheznanohana/nekodrop/issues/30), [#118](https://github.com/zheznanohana/nekodrop/pull/118), [#122](https://github.com/zheznanohana/nekodrop/issues/122)):**
+  - Sets `bssid_addr = kAwdlBssid` and basic ACK rates whenever `!_promisc && _ba_station` on the listener MAC context, restoring unicast mDNS/TCP/ICMP reception while keeping `IN_PROMISC=0` so hardware RX Block ACKs stay at full 50+ MiB/s.
+- **Back off A-MPDU stalls (60 s / 5 min) instead of permanently disabling aggregation for the session, resetting the stall count after a successful Block Ack send (PR #121, thanks [@sh17632](https://github.com/sh17632)).**
+
+---
+
 ## v2.3.10 (Preview / 预览版)
 
 ### 中文

@@ -2317,11 +2317,20 @@ int IwxDevice::mac_ctxt_cmd(uint32_t action) {
    * (awdlCoexBaFilterOff, filter 3): AWDL's BSSID, ACK rates, group frames
    * only. Never apply this during discovery or while asking for Block Ack:
    * 0.1.28 stripped IN_CONTROL_AND_MGMT / IN_PROMISC during asking and the
-   * firmware dropped every ADDBA Response (asks 80, agreed 0, #4). */
+   * firmware dropped every ADDBA Response (asks 80, agreed 0, #4).
+   *
+   * When BaFilter clears IN_PROMISC during an RX Block Ack session without TX
+   * aggregation (!_promisc && _ba_station && !_agg_active), the MAC context
+   * must still carry kAwdlBssid and basic ACK rates — leaving bssid_addr as
+   * kBroadcast while IN_PROMISC is off made AX211/AX210 firmware drop unicast
+   * AWDL frames (ICMP, TCP ACKs, mDNS QU replies) (#30, #118, #122). */
   const bool ba_listener =
       _opt.mac_type == MacType::Listener && _opt.aggregate && _agg_active && !_promisc && _ba_station;
-  std::memcpy(cmd.bssid_addr, (_opt.mac_type == MacType::Listener && !ba_listener) ? kBroadcast : kAwdlBssid, 6);
-  if (_opt.mac_type != MacType::Listener || ba_listener) {
+  const bool rx_ba_filtered =
+      _opt.mac_type == MacType::Listener && !_promisc && _ba_station;
+  std::memcpy(cmd.bssid_addr,
+              (_opt.mac_type == MacType::Listener && !ba_listener && !rx_ba_filtered) ? kBroadcast : kAwdlBssid, 6);
+  if (_opt.mac_type != MacType::Listener || ba_listener || rx_ba_filtered) {
     /* ACK rates: the OFDM basics on 5 GHz, CCK and OFDM on 2.4 GHz. */
     cmd.cck_rates = htole32(_channel <= 14 ? 0x0f : 0);
     cmd.ofdm_rates = htole32(0x15); /* 6, 12, 24 */
